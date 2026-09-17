@@ -27,13 +27,14 @@
 | Component | AWS Resource | File Path | Core Responsibility |
 |---|---|---|---|
 | **State Store** | `AWS::DynamoDB::Table` (`LoopGuardState`) | `template.yaml` | Single-table store with TTL tracking incident audit records and active session quarantine locks. |
-| **Target Function** | `AWS::Serverless::Function` (`LoopGuard-TargetFunction`) | `src/target/app.py` | Monitored workload. Checks DynamoDB session lock inline (`ConsistentRead=True`). Simulates runaway retry loops when triggered. Capped at 50 concurrent executions. |
+| **Postmortem Store** | `AWS::S3::Bucket` (`loopguard-postmortems-...`) | `template.yaml` | S3 bucket storing auto-generated Markdown SRE postmortems with 7-day lifecycle expiration. |
+| **Target Function** | `AWS::Serverless::Function` (`LoopGuard-TargetFunction`) | `src/target/app.py` | Monitored workload. Checks DynamoDB session lock inline (`ConsistentRead=True`). Simulates runaway retry loops when triggered. Operating on standard unreserved pool. |
 | **Metric Alarm** | `AWS::CloudWatch::Alarm` (`LoopGuard-TargetInvocationsSpike`) | `template.yaml` | Tracks Invocations $\ge 20$ in a 60-second window. Fires state-change event on breach. |
 | **Routing Bus** | `AWS::Events::Rule` | `template.yaml` | Pattern matches CloudWatch Alarm State Change where `state.value = ALARM`, invoking orchestrator. |
-| **Orchestrator** | `AWS::Serverless::Function` (`LoopGuard-OrchestratorFunction`) | `src/orchestrator/app.py` | Unpacks nested JSON logs, computes difflib similarity ($\ge 0.70$ threshold), prompts Bedrock Claude 3.5 Sonnet for RCA, and posts webhook alert cards. |
+| **Orchestrator** | `AWS::Serverless::Function` (`LoopGuard-OrchestratorFunction`) | `src/orchestrator/app.py` | Unpacks nested JSON logs, computes difflib similarity ($\ge 0.70$ threshold), prompts Bedrock Claude / Nova for RCA, and posts webhook alert cards. |
 | **Control API** | `AWS::Serverless::HttpApi` (`LoopGuard-ControlApi`) | `template.yaml` | Exposes authenticated `/remediate` endpoint. |
-| **Remediation** | `AWS::Serverless::Function` (`LoopGuard-RemediationFunction`) | `src/remediation/app.py` | Validates auth token. Executes surgical quarantine (writes DynamoDB TTL lock) or global shutdown (`ReservedConcurrentExecutions: 0`). |
-| **Reset Tooling** | CLI Script (Python / Boto3) | `scripts/reset_demo.py` | Clears Lambda concurrency overrides, forces alarm to OK, and purges session locks for demo retakes. |
+| **Remediation** | `AWS::Serverless::Function` (`LoopGuard-RemediationFunction`) | `src/remediation/app.py` | Validates auth token. Executes surgical quarantine (writes DynamoDB TTL lock) or global shutdown (`ReservedConcurrentExecutions: 0`). Generates S3 postmortems with pre-signed download URLs. |
+| **Reset Tooling** | CLI Script (Python / Boto3) | `scripts/reset_demo.py` | Clears Lambda concurrency overrides, forces alarm to OK, and purges session locks for demo retakes (< 5.0s). |
 
 ---
 
