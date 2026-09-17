@@ -213,6 +213,7 @@ Resources:
           STATE_TABLE_NAME: !Ref LoopGuardState
           REMEDIATION_AUTH_TOKEN: !Ref RemediationAuthToken
           HMAC_SECRET: !Ref RemediationAuthToken
+          POSTMORTEM_BUCKET: !Ref GuardPostmortemBucket
       Events:
         RemediateGet:
           Type: HttpApi
@@ -238,6 +239,36 @@ Resources:
                 - lambda:DeleteFunctionConcurrency
                 - lambda:GetFunctionConcurrency
               Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:LoopGuard-*"
+            # S3 Read/Write for Auto-Generated Postmortems
+            - Sid: S3PostmortemPolicy
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub "${GuardPostmortemBucket.Arn}/*"
+
+  # ==============================================================================
+  # 8. Postmortem Artifact Store: S3 Bucket
+  # ==============================================================================
+  GuardPostmortemBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "loopguard-postmortems-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: LoopGuard
+        - Key: ManagedBy
+          Value: AWS-SAM
 
 Outputs:
   TargetFunctionArn:
@@ -261,3 +292,6 @@ Outputs:
   StateTableName:
     Description: "DynamoDB State & Quarantine Table"
     Value: !Ref LoopGuardState
+  PostmortemBucketName:
+    Description: "S3 Bucket storing auto-generated SRE incident postmortems"
+    Value: !Ref GuardPostmortemBucket
