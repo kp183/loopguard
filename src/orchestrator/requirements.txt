@@ -1,0 +1,3 @@
+# LoopGuard Orchestrator Dependencies
+# Standard library dataclasses and urllib used for zero-bloat instantaneous builds.
+# boto3 is provided natively by the AWS Lambda Python runtime.

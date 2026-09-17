@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  LoopGuard: Autonomous, Real-Time Circuit Breaker & Surgical Session Isolation Engine for AWS Serverless & Bedrock Pipelines.
+
+Parameters:
+  WebhookUrl:
+    Type: String
+    Default: ""
+    Description: "Target Slack or Discord webhook URL for incident dispatch (Tier 1 Base Webhook)."
+  HmacSecret:
+    Type: String
+    Default: "LoopGuardSecretKey-ChangeInProd"
+    NoEcho: true
+    Description: "HMAC secret key used to sign and verify one-time remediation links."
+  BedrockModelId:
+    Type: String
+    Default: "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    Description: "Bedrock Foundation Model or Inference Profile ID for root cause analysis."
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 30
+    MemorySize: 256
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+  # ==============================================================================
+  # 1. State Store: Single-Table DynamoDB with Native TTL
+  # ==============================================================================
+  LoopGuardState:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: LoopGuardState
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: LoopGuard
+        - Key: ManagedBy
+          Value: AWS-SAM
+
+  # ==============================================================================
+  # 2. Monitored Workload: GuardTargetFunction with Safety Ceiling
+  # ==============================================================================
+  GuardTargetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: LoopGuard-TargetFunction
+      CodeUri: src/target/
+      Handler: app.lambda_handler
+      ReservedConcurrentExecutions: 50
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Ref LoopGuardState
+          TARGET_FUNCTION_NAME: LoopGuard-TargetFunction
+      Policies:
+        # Scoped read-only access to state store for inline session lock check
+        - Statement:
+            - Sid: DynamoDBSessionReadPolicy
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt LoopGuardState.Arn
+            # Scoped self-invocation permission to simulate agent retry loops
+            - Sid: SelfInvocationPolicy
+              Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:LoopGuard-TargetFunction"
+
+  # ==============================================================================
+  # 3. Anomaly Detection: CloudWatch Metric Alarm on Invocation Velocity
+  # ==============================================================================
+  GuardTargetInvocationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: LoopGuard-TargetInvocationsSpike
+      AlarmDescription: "Triggers when LoopGuard-TargetFunction invocation velocity reaches >=20 in 60 seconds."
+      MetricName: Invocations
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GuardTargetFunction
+
+  # ==============================================================================
+  # 4. Remediation Control Plane: HTTP API Gateway
+  # ==============================================================================
+  GuardHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: LoopGuard-ControlApi
+      Description: "Authenticated remediation control plane for LoopGuard"
+
+  # ==============================================================================
+  # 5. Diagnostic Engine: GuardOrchestratorFunction
+  # ==============================================================================
+  GuardOrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: LoopGuard-OrchestratorFunction
+      CodeUri: src/orchestrator/
+      Handler: app.lambda_handler
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Ref LoopGuardState
+          WEBHOOK_URL: !Ref WebhookUrl
+          CONTROL_API_URL: !Sub "https://${GuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+          HMAC_SECRET: !Ref HmacSecret
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        # DynamoDB Write Access for Incident Audit Records
+        - Statement:
+            - Sid: DynamoDBIncidentWritePolicy
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+              Resource: !GetAtt LoopGuardState.Arn
+            # CloudWatch Logs Ingestion with Stream Wildcards
+            - Sid: CloudWatchLogsReadPolicy
+              Effect: Allow
+              Action:
+                - logs:FilterLogEvents
+                - logs:GetLogEvents
+                - logs:DescribeLogStreams
+              Resource:
+                - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/LoopGuard-*"
+                - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/LoopGuard-*:*"
+            # Bedrock Invocation Scope: Foundation Models & Cross-Region Inference Profiles
+            - Sid: BedrockInvokePolicy
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - "arn:aws:bedrock:*::foundation-model/*"
+                - "arn:aws:bedrock:*:*:inference-profile/*"
+            # Resource Groups Tagging API for Tier 2 Team Routing Lookup
+            - Sid: ResourceTagLookupPolicy
+              Effect: Allow
+              Action:
+                - tag:GetResources
+              Resource: "*"
+
+  # ==============================================================================
+  # 6. EventBridge Bus: Alarm State Change Router to Orchestrator
+  # ==============================================================================
+  GuardAlarmEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: LoopGuard-AlarmRoutingRule
+      Description: "Routes CloudWatch Alarm ALARM state change to LoopGuard-OrchestratorFunction"
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - LoopGuard-TargetInvocationsSpike
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Id: GuardOrchestratorTarget
+          Arn: !GetAtt GuardOrchestratorFunction.Arn
+
+  GuardOrchestratorPermissionForEvents:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GuardOrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GuardAlarmEventRule.Arn
+
+  # ==============================================================================
+  # 7. Remediation Engine: GuardRemediationFunction (Dual Blast Radii)
+  # ==============================================================================
+  GuardRemediationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: LoopGuard-RemediationFunction
+      CodeUri: src/remediation/
+      Handler: app.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Ref LoopGuardState
+          HMAC_SECRET: !Ref HmacSecret
+      Events:
+        RemediateGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GuardHttpApi
+            Path: /remediate
+            Method: GET
+      Policies:
+        # Surgical Session Lock & Incident Record Updates
+        - Statement:
+            - Sid: DynamoDBRemediationPolicy
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+              Resource: !GetAtt LoopGuardState.Arn
+            # Concurrency Management Scoped Strictly to LoopGuard Target Functions
+            - Sid: LambdaConcurrencyPolicy
+              Effect: Allow
+              Action:
+                - lambda:PutFunctionConcurrency
+                - lambda:DeleteFunctionConcurrency
+                - lambda:GetFunctionConcurrency
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:LoopGuard-*"
+
+Outputs:
+  TargetFunctionArn:
+    Description: "ARN of the monitored workload function"
+    Value: !GetAtt GuardTargetFunction.Arn
+  OrchestratorFunctionArn:
+    Description: "ARN of the diagnostic orchestrator function"
+    Value: !GetAtt GuardOrchestratorFunction.Arn
+  RemediationFunctionArn:
+    Description: "ARN of the remediation execution function"
+    Value: !GetAtt GuardRemediationFunction.Arn
+  ControlApiEndpoint:
+    Description: "Base URL of the authenticated HTTP API Gateway"
+    Value: !Sub "https://${GuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  RemediateUrl:
+    Description: "Remediation endpoint URL"
+    Value: !Sub "https://${GuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com/remediate"
+  StateTableName:
+    Description: "DynamoDB State & Quarantine Table"
+    Value: !Ref LoopGuardState

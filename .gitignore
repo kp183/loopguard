@@ -1,0 +1,8 @@
+.aws-sam/
+__pycache__/
+*.pyc
+.env
+response.json
+out.json
+*.swp
+.DS_Store

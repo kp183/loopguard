@@ -1,0 +1,2 @@
+# LoopGuard Remediation Function Dependencies
+# boto3 is natively provided by the AWS Lambda Python runtime.
