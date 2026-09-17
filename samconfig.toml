@@ -1,0 +1,31 @@
+version = 0.1
+
+[default]
+[default.global]
+[default.global.parameters]
+stack_name = "LoopGuardStack"
+
+[default.build]
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate]
+[default.validate.parameters]
+lint = true
+
+[default.deploy]
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+resolve_s3 = true
+stack_name = "LoopGuardStack"
+s3_prefix = "LoopGuardStack"
+region = "us-east-1"
+disable_rollback = true
+parameter_overrides = [
+  "RemediationAuthToken=kroid-guard-sec-token-2026",
+  "WebhookUrl=\"\"",
+  "BedrockModelId=us.anthropic.claude-sonnet-4-20250514-v1:0"
+]
+image_repositories = []

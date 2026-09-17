@@ -63,7 +63,6 @@ Resources:
       FunctionName: LoopGuard-TargetFunction
       CodeUri: src/target/
       Handler: app.lambda_handler
-      ReservedConcurrentExecutions: 50
       Environment:
         Variables:
           STATE_TABLE_NAME: !Ref LoopGuardState

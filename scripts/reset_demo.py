@@ -60,14 +60,15 @@ def reset_lambda_concurrency(lambda_client, function_name: str):
             print(f"    [!] delete_function_concurrency note: {e}")
 
     try:
-        # Ensure the 50 safety concurrency ceiling is active
+        # Optional: Attempt to set concurrency ceiling if account limit permits
         lambda_client.put_function_concurrency(
             FunctionName=function_name,
             ReservedConcurrentExecutions=50
         )
         print(f"    [+] Enforced ReservedConcurrentExecutions=50 safety ceiling on {function_name}.")
     except ClientError as e:
-        print(f"    [!] Error restoring concurrency ceiling: {e}")
+        # Expected on accounts with low default unreserved concurrency
+        print(f"    [*] Target function operating on standard unreserved pool (unthrottled).")
 
 
 def reset_cloudwatch_alarm(cloudwatch_client, alarm_name: str):
