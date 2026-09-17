@@ -8,15 +8,15 @@ Parameters:
     Type: String
     Default: ""
     Description: "Target Slack or Discord webhook URL for incident dispatch (Tier 1 Base Webhook)."
-  HmacSecret:
+  RemediationAuthToken:
     Type: String
-    Default: "LoopGuardSecretKey-ChangeInProd"
+    Default: "kroid-guard-sec-token-2026"
     NoEcho: true
-    Description: "HMAC secret key used to sign and verify one-time remediation links."
+    Description: "HMAC secret token used to sign and verify one-time remediation links."
   BedrockModelId:
     Type: String
-    Default: "anthropic.claude-3-5-sonnet-20240620-v1:0"
-    Description: "Bedrock Foundation Model or Inference Profile ID for root cause analysis."
+    Default: "us.anthropic.claude-sonnet-4-20250514-v1:0"
+    Description: "Bedrock foundation model or cross-region inference profile ID."
 
 Globals:
   Function:
@@ -126,9 +126,11 @@ Resources:
       Environment:
         Variables:
           STATE_TABLE_NAME: !Ref LoopGuardState
+          REMEDIATION_ENDPOINT: !Sub "https://${GuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com/remediate"
+          CONTROL_API_URL: !Sub "https://${GuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com/remediate"
+          REMEDIATION_AUTH_TOKEN: !Ref RemediationAuthToken
+          HMAC_SECRET: !Ref RemediationAuthToken
           WEBHOOK_URL: !Ref WebhookUrl
-          CONTROL_API_URL: !Sub "https://${GuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
-          HMAC_SECRET: !Ref HmacSecret
           BEDROCK_MODEL_ID: !Ref BedrockModelId
       Policies:
         # DynamoDB Write Access for Incident Audit Records
@@ -210,7 +212,8 @@ Resources:
       Environment:
         Variables:
           STATE_TABLE_NAME: !Ref LoopGuardState
-          HMAC_SECRET: !Ref HmacSecret
+          REMEDIATION_AUTH_TOKEN: !Ref RemediationAuthToken
+          HMAC_SECRET: !Ref RemediationAuthToken
       Events:
         RemediateGet:
           Type: HttpApi
@@ -250,6 +253,9 @@ Outputs:
   ControlApiEndpoint:
     Description: "Base URL of the authenticated HTTP API Gateway"
     Value: !Sub "https://${GuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  RemediationApiUrl:
+    Description: "URL endpoint for remediation actions"
+    Value: !Sub "https://${GuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com/remediate"
   RemediateUrl:
     Description: "Remediation endpoint URL"
     Value: !Sub "https://${GuardHttpApi}.execute-api.${AWS::Region}.amazonaws.com/remediate"

@@ -32,9 +32,21 @@ bedrock_client = boto3.client("bedrock-runtime")
 
 STATE_TABLE_NAME = os.environ.get("STATE_TABLE_NAME", "LoopGuardState")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-CONTROL_API_URL = os.environ.get("CONTROL_API_URL", "https://localhost/remediate")
-HMAC_SECRET = os.environ.get("HMAC_SECRET", "LoopGuardSecretKey-ChangeInProd")
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0")
+REMEDIATION_ENDPOINT = os.environ.get(
+    "REMEDIATION_ENDPOINT",
+    os.environ.get("CONTROL_API_URL", "https://localhost/remediate")
+)
+if not REMEDIATION_ENDPOINT.endswith("/remediate"):
+    REMEDIATION_ENDPOINT = f"{REMEDIATION_ENDPOINT}/remediate"
+
+HMAC_SECRET = os.environ.get(
+    "REMEDIATION_AUTH_TOKEN",
+    os.environ.get("HMAC_SECRET", "kroid-guard-sec-token-2026")
+)
+BEDROCK_MODEL_ID = os.environ.get(
+    "BEDROCK_MODEL_ID",
+    "us.anthropic.claude-sonnet-4-20250514-v1:0"
+)
 
 state_table = dynamodb.Table(STATE_TABLE_NAME)
 
@@ -445,11 +457,11 @@ def lambda_handler(event, context):
     token_global = generate_hmac_token(HMAC_SECRET, f"{incident_id}:global:{target_function}")
 
     surgical_url = (
-        f"{CONTROL_API_URL}/remediate?"
+        f"{REMEDIATION_ENDPOINT}?"
         f"token={token_session}&action=session&session_id={session_id}&incident_id={incident_id}"
     )
     global_url = (
-        f"{CONTROL_API_URL}/remediate?"
+        f"{REMEDIATION_ENDPOINT}?"
         f"token={token_global}&action=global&function={target_function}&incident_id={incident_id}"
     )
 

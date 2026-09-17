@@ -26,7 +26,10 @@ dynamodb = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")
 
 STATE_TABLE_NAME = os.environ.get("STATE_TABLE_NAME", "LoopGuardState")
-HMAC_SECRET = os.environ.get("HMAC_SECRET", "LoopGuardSecretKey-ChangeInProd")
+HMAC_SECRET = os.environ.get(
+    "REMEDIATION_AUTH_TOKEN",
+    os.environ.get("HMAC_SECRET", "kroid-guard-sec-token-2026")
+)
 state_table = dynamodb.Table(STATE_TABLE_NAME)
 
 
