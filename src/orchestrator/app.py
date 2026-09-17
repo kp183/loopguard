@@ -422,7 +422,27 @@ def lambda_handler(event, context):
         recent_logs=raw_logs
     )
 
-    # 5. Persist Incident Audit Record in DynamoDB (Single Table Schema)
+    # 5. Generate Authenticated Remediation URLs
+    token_session = generate_hmac_token(HMAC_SECRET, f"{incident_id}:session:{session_id}")
+    token_global = generate_hmac_token(HMAC_SECRET, f"{incident_id}:global:{target_function}")
+
+    surgical_url = (
+        f"{REMEDIATION_ENDPOINT}?"
+        f"token={token_session}&action=session&session_id={session_id}&incident_id={incident_id}"
+    )
+    global_url = (
+        f"{REMEDIATION_ENDPOINT}?"
+        f"token={token_global}&action=global&function={target_function}&incident_id={incident_id}"
+    )
+
+    logger.info(json.dumps({
+        "event": "guard_remediation_urls_generated",
+        "incident_id": incident_id,
+        "remediation_url_session": surgical_url,
+        "remediation_url_global": global_url
+    }))
+
+    # 6. Persist Incident Audit Record in DynamoDB (Single Table Schema)
     try:
         state_table.put_item(
             Item={
@@ -436,6 +456,8 @@ def lambda_handler(event, context):
                 "root_cause_summary": diagnostic.root_cause_summary,
                 "detected_pattern": diagnostic.detected_pattern,
                 "estimated_burn_rate": diagnostic.estimated_burn_rate,
+                "remediation_url_session": surgical_url,
+                "remediation_url_global": global_url,
                 "status": "ANALYZED",
                 "ttl": int(time.time()) + 86400  # 24-hour audit retention
             }
@@ -451,19 +473,6 @@ def lambda_handler(event, context):
             "error": str(e),
             "incident_id": incident_id
         }))
-
-    # 6. Generate Authenticated Remediation URLs
-    token_session = generate_hmac_token(HMAC_SECRET, f"{incident_id}:session:{session_id}")
-    token_global = generate_hmac_token(HMAC_SECRET, f"{incident_id}:global:{target_function}")
-
-    surgical_url = (
-        f"{REMEDIATION_ENDPOINT}?"
-        f"token={token_session}&action=session&session_id={session_id}&incident_id={incident_id}"
-    )
-    global_url = (
-        f"{REMEDIATION_ENDPOINT}?"
-        f"token={token_global}&action=global&function={target_function}&incident_id={incident_id}"
-    )
 
     # 7. Dispatch Webhook Card (Tier 1 Core)
     dispatch_webhook_notification(
