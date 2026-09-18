@@ -167,8 +167,9 @@ python scripts/reset_demo.py
 ## 8. Current Implementation Status
 - [x] `docs/PRD.md`: Synchronized. Acceptance criteria defined. Tier 1 / Tier 2 cleanly separated.
 - [x] `ARCHITECTURE.md`: Synchronized. Single-table DynamoDB schema and mathematical formulations documented.
-- [x] `template.yaml`: Configured with safety cap (`ReservedConcurrentExecutions: 50`), Bedrock inference profile IAM scope, CloudWatch stream wildcards, and `WebhookUrl` parameter.
+- [x] `template.yaml`: Configured with safety caps, Bedrock inference profile IAM scope, CloudWatch stream wildcards, S3 postmortem bucket, secondary target function (`Infra-Core`), dual CloudWatch alarms, and team routing parameters (`WebhookUrlPrimary`, `WebhookUrlSecondary`).
 - [x] `src/target/app.py`: Configured with consistent read DynamoDB session checks, query mutation simulation, and self-invocation loop.
-- [x] `src/orchestrator/app.py`: Defensive dimension extraction, recursive JSON log unwrapping, difflib similarity calculation, Bedrock Claude 3.5 Sonnet RCA with deterministic fallback, and zero-dependency Discord/Slack webhook dispatch.
-- [x] `src/remediation/app.py`: Implements dual blast radii: surgical 10-minute DynamoDB TTL lock (`action=session`) and emergency global throttle (`action=global`).
-- [x] `scripts/reset_demo.py`: Automated environment restoration utility.
+- [x] `src/orchestrator/app.py`: Defensive dimension extraction, recursive JSON log unwrapping, difflib similarity calculation, Bedrock RCA with deterministic fallback, zero-dependency Discord/Slack webhook dispatch, and AWS Resource Groups Tagging API (`tag:GetResources`) team resolution with defensive fallback.
+- [x] `src/remediation/app.py`: Implements dual blast radii: surgical 10-minute DynamoDB TTL lock (`action=session`) and emergency global throttle (`action=global`), plus automatic Markdown postmortem generation to S3 with pre-signed download URLs.
+- [x] `scripts/reset_demo.py`: Automated environment restoration utility resetting both primary and secondary functions and alarms in ~5-6s.
+- [x] `Module 3 (Team-Based Routing)`: Fully verified live in `us-east-1` (Account 740536073144) with tag lookup, dual alarms, EventBridge dispatch, and full regression check.
