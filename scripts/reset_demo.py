@@ -107,6 +107,16 @@ def purge_session_quarantine_locks(dynamodb_resource, table_name: str):
         print(f"    [-] Error purging DynamoDB session locks: {e}")
 
 
+TARGET_FUNCTIONS = [
+    os.environ.get("TARGET_FUNCTION_NAME", "LoopGuard-TargetFunction"),
+    "LoopGuard-TargetFunctionSecondary"
+]
+ALARM_NAMES = [
+    os.environ.get("ALARM_NAME", "LoopGuard-TargetInvocationsSpike"),
+    "LoopGuard-TargetSecondaryInvocationsSpike"
+]
+
+
 def main():
     start_time = time.time()
     args = parse_args()
@@ -114,8 +124,8 @@ def main():
     print(" LoopGuard: Autonomous Circuit Breaker - Rehearsal Reset Utility ")
     print("=================================================================")
     print(f"Target Region: {args.region}")
-    print(f"Target Function: {args.function_name}")
-    print(f"Alarm Name: {args.alarm_name}")
+    print(f"Target Functions: {', '.join(TARGET_FUNCTIONS)}")
+    print(f"Alarm Names: {', '.join(ALARM_NAMES)}")
     print(f"State Table: {args.table_name}")
     print("-----------------------------------------------------------------")
 
@@ -127,8 +137,12 @@ def main():
     cloudwatch_client = boto3.client("cloudwatch", region_name=args.region)
     dynamodb_resource = boto3.resource("dynamodb", region_name=args.region)
 
-    reset_lambda_concurrency(lambda_client, args.function_name)
-    reset_cloudwatch_alarm(cloudwatch_client, args.alarm_name)
+    for fn in TARGET_FUNCTIONS:
+        reset_lambda_concurrency(lambda_client, fn)
+
+    for alarm in ALARM_NAMES:
+        reset_cloudwatch_alarm(cloudwatch_client, alarm)
+
     purge_session_quarantine_locks(dynamodb_resource, args.table_name)
 
     elapsed = time.time() - start_time

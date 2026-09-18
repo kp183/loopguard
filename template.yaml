@@ -8,6 +8,14 @@ Parameters:
     Type: String
     Default: ""
     Description: "Target Slack or Discord webhook URL for incident dispatch (Tier 1 Base Webhook)."
+  WebhookUrlPrimary:
+    Type: String
+    Default: ""
+    Description: "Incoming webhook URL for Team Payments-Core."
+  WebhookUrlSecondary:
+    Type: String
+    Default: ""
+    Description: "Incoming webhook URL for Team Infra-Core."
   RemediationAuthToken:
     Type: String
     Default: "kroid-guard-sec-token-2026"
@@ -55,7 +63,7 @@ Resources:
           Value: AWS-SAM
 
   # ==============================================================================
-  # 2. Monitored Workload: GuardTargetFunction with Safety Ceiling
+  # 2. Monitored Workloads: Tagged Target Functions
   # ==============================================================================
   GuardTargetFunction:
     Type: AWS::Serverless::Function
@@ -63,6 +71,9 @@ Resources:
       FunctionName: LoopGuard-TargetFunction
       CodeUri: src/target/
       Handler: app.lambda_handler
+      Tags:
+        Team: Payments-Core
+        Project: LoopGuard
       Environment:
         Variables:
           STATE_TABLE_NAME: !Ref LoopGuardState
@@ -82,8 +93,34 @@ Resources:
                 - lambda:InvokeFunction
               Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:LoopGuard-TargetFunction"
 
+  GuardTargetFunctionSecondary:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: LoopGuard-TargetFunctionSecondary
+      CodeUri: src/target/
+      Handler: app.lambda_handler
+      Tags:
+        Team: Infra-Core
+        Project: LoopGuard
+      Environment:
+        Variables:
+          STATE_TABLE_NAME: !Ref LoopGuardState
+          TARGET_FUNCTION_NAME: LoopGuard-TargetFunctionSecondary
+      Policies:
+        - Statement:
+            - Sid: DynamoDBSessionReadPolicy
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt LoopGuardState.Arn
+            - Sid: SelfInvocationPolicy
+              Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:LoopGuard-TargetFunctionSecondary"
+
   # ==============================================================================
-  # 3. Anomaly Detection: CloudWatch Metric Alarm on Invocation Velocity
+  # 3. Anomaly Detection: CloudWatch Metric Alarms on Invocation Velocity
   # ==============================================================================
   GuardTargetInvocationAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -101,6 +138,23 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref GuardTargetFunction
+
+  GuardTargetSecondaryInvocationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: LoopGuard-TargetSecondaryInvocationsSpike
+      AlarmDescription: "Triggers when LoopGuard-TargetFunctionSecondary invocation velocity reaches >=20 in 60 seconds."
+      MetricName: Invocations
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GuardTargetFunctionSecondary
 
   # ==============================================================================
   # 4. Remediation Control Plane: HTTP API Gateway
@@ -130,7 +184,10 @@ Resources:
           REMEDIATION_AUTH_TOKEN: !Ref RemediationAuthToken
           HMAC_SECRET: !Ref RemediationAuthToken
           WEBHOOK_URL: !Ref WebhookUrl
+          WEBHOOK_URL_PRIMARY: !Ref WebhookUrlPrimary
+          WEBHOOK_URL_SECONDARY: !Ref WebhookUrlSecondary
           BEDROCK_MODEL_ID: !Ref BedrockModelId
+          AWS_ACCOUNT_ID: !Sub "${AWS::AccountId}"
       Policies:
         # DynamoDB Write Access for Incident Audit Records
         - Statement:
@@ -182,6 +239,7 @@ Resources:
         detail:
           alarmName:
             - LoopGuard-TargetInvocationsSpike
+            - LoopGuard-TargetSecondaryInvocationsSpike
           state:
             value:
               - ALARM
@@ -274,6 +332,9 @@ Outputs:
   TargetFunctionArn:
     Description: "ARN of the monitored workload function"
     Value: !GetAtt GuardTargetFunction.Arn
+  TargetFunctionSecondaryArn:
+    Description: "ARN of the secondary monitored workload function (Infra-Core)"
+    Value: !GetAtt GuardTargetFunctionSecondary.Arn
   OrchestratorFunctionArn:
     Description: "ARN of the diagnostic orchestrator function"
     Value: !GetAtt GuardOrchestratorFunction.Arn

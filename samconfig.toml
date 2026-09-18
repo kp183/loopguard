@@ -26,6 +26,8 @@ disable_rollback = true
 parameter_overrides = [
   "RemediationAuthToken=kroid-guard-sec-token-2026",
   "WebhookUrl=\"\"",
+  "WebhookUrlPrimary=\"\"",
+  "WebhookUrlSecondary=\"\"",
   "BedrockModelId=us.anthropic.claude-sonnet-4-20250514-v1:0"
 ]
 image_repositories = []

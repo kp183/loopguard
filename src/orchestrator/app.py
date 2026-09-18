@@ -29,9 +29,15 @@ logger.setLevel(logging.INFO)
 logs_client = boto3.client("logs")
 dynamodb = boto3.resource("dynamodb")
 bedrock_client = boto3.client("bedrock-runtime")
+tagging_client = boto3.client("resourcegroupstaggingapi")
 
 STATE_TABLE_NAME = os.environ.get("STATE_TABLE_NAME", "LoopGuardState")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+WEBHOOK_URL_PRIMARY = os.environ.get("WEBHOOK_URL_PRIMARY", "")
+WEBHOOK_URL_SECONDARY = os.environ.get("WEBHOOK_URL_SECONDARY", "")
+AWS_ACCOUNT_ID = os.environ.get("AWS_ACCOUNT_ID", "")
+AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+
 REMEDIATION_ENDPOINT = os.environ.get(
     "REMEDIATION_ENDPOINT",
     os.environ.get("CONTROL_API_URL", "https://localhost/remediate")
@@ -314,6 +320,63 @@ Assistant:"""
     return generate_fallback_diagnostic(function_name, stagnation_ratio, is_stagnant)
 
 
+def resolve_team_webhook(target_function_name: str, context: Any = None) -> Tuple[str, str]:
+    """
+    Queries AWS Resource Groups Tagging API (tag:GetResources) to determine the owning team tag
+    and returns (team_name, resolved_webhook_url).
+    Defensively falls back to WEBHOOK_URL_PRIMARY or WEBHOOK_URL on lookup failure or unmapped team.
+    """
+    fallback_url = WEBHOOK_URL_PRIMARY or WEBHOOK_URL
+
+    account_id = AWS_ACCOUNT_ID
+    if not account_id and context and hasattr(context, "invoked_function_arn"):
+        try:
+            account_id = context.invoked_function_arn.split(":")[4]
+        except Exception:
+            pass
+    if not account_id:
+        account_id = "740536073144"
+
+    current_region = AWS_REGION or "us-east-1"
+    function_arn = (
+        target_function_name
+        if target_function_name.startswith("arn:aws:lambda:")
+        else f"arn:aws:lambda:{current_region}:{account_id}:function:{target_function_name}"
+    )
+    team_tag = "Unassigned"
+
+    try:
+        response = tagging_client.get_resources(ResourceARNList=[function_arn])
+        mappings = response.get("ResourceTagMappingList", [])
+        if mappings:
+            for tag in mappings[0].get("Tags", []):
+                if tag.get("Key") == "Team":
+                    team_tag = tag.get("Value", "Unassigned")
+                    break
+        logger.info(json.dumps({
+            "event": "guard_tag_lookup_resolved",
+            "target_function": target_function_name,
+            "team_tag": team_tag
+        }))
+    except Exception as e:
+        logger.error(json.dumps({
+            "event": "guard_tag_lookup_error",
+            "error": str(e),
+            "function_arn": function_arn
+        }))
+
+    routing_map = {
+        "Payments-Core": WEBHOOK_URL_PRIMARY or fallback_url,
+        "Infra-Core": WEBHOOK_URL_SECONDARY or fallback_url
+    }
+
+    resolved_url = routing_map.get(team_tag)
+    if not resolved_url:
+        resolved_url = fallback_url
+
+    return team_tag, resolved_url
+
+
 def dispatch_webhook_notification(
     webhook_url: str,
     incident_id: str,
@@ -322,10 +385,11 @@ def dispatch_webhook_notification(
     stagnation_ratio: float,
     diagnostic: DiagnosticResult,
     surgical_url: str,
-    global_url: str
+    global_url: str,
+    owning_team: str = "Unassigned"
 ) -> bool:
     """
-    Tier 1 Base Webhook Dispatch.
+    Tier 1 Base Webhook / Tier 2 Team-Routed Webhook Dispatch.
     Dispatches a structured embed card to Discord or Slack using Python standard library urllib.
     Zero external dependencies required.
     """
@@ -333,6 +397,8 @@ def dispatch_webhook_notification(
         logger.info(json.dumps({
             "event": "guard_webhook_skipped_no_url",
             "incident_id": incident_id,
+            "target_function": target_function,
+            "owning_team": owning_team,
             "surgical_url": surgical_url,
             "global_url": global_url
         }))
@@ -340,13 +406,14 @@ def dispatch_webhook_notification(
 
     # Universal payload structured for Discord and Slack webhooks
     card = {
-        "content": f"🚨 **LoopGuard Circuit Breaker Alert: {incident_id}**",
+        "content": f"🚨 **LoopGuard Circuit Breaker Alert: {incident_id} [{owning_team}]**",
         "embeds": [
             {
-                "title": f"Runaway Loop Intercepted: `{target_function}`",
+                "title": f"Runaway Loop Intercepted: `{target_function}` [{owning_team}]",
                 "color": 15158332,  # Crimson Red
                 "fields": [
                     {"name": "Target Function", "value": f"`{target_function}`", "inline": True},
+                    {"name": "Owning Team", "value": f"`{owning_team}`", "inline": True},
                     {"name": "Session ID", "value": f"`{session_id}`", "inline": True},
                     {"name": "Stagnation Ratio", "value": f"**{stagnation_ratio:.3f}** (Threshold: 0.700)", "inline": True},
                     {"name": "Detected Pattern", "value": f"`{diagnostic.detected_pattern}`", "inline": True},
@@ -364,7 +431,7 @@ def dispatch_webhook_notification(
                     }
                 ],
                 "footer": {
-                    "text": "LoopGuard Autonomous Reliability Engine • Bharat Builds Tour"
+                    "text": f"Incident ID: {incident_id} • Team: {owning_team} • LoopGuard Autonomous Reliability Engine"
                 }
             }
         ]
@@ -380,6 +447,7 @@ def dispatch_webhook_notification(
             logger.info(json.dumps({
                 "event": "guard_webhook_dispatched",
                 "incident_id": incident_id,
+                "owning_team": owning_team,
                 "status_code": response.status
             }))
             return True
@@ -387,7 +455,8 @@ def dispatch_webhook_notification(
         logger.error(json.dumps({
             "event": "guard_webhook_dispatch_error",
             "error": str(e),
-            "incident_id": incident_id
+            "incident_id": incident_id,
+            "owning_team": owning_team
         }))
         return False
 
@@ -442,7 +511,10 @@ def lambda_handler(event, context):
         "remediation_url_global": global_url
     }))
 
-    # 6. Persist Incident Audit Record in DynamoDB (Single Table Schema)
+    # 6. Resolve Destination Webhook via Team Tag Routing
+    owning_team, target_webhook_url = resolve_team_webhook(target_function, context)
+
+    # 7. Persist Incident Audit Record in DynamoDB (Single Table Schema)
     try:
         state_table.put_item(
             Item={
@@ -451,6 +523,7 @@ def lambda_handler(event, context):
                 "target_function": target_function,
                 "session_id": session_id,
                 "alarm_name": alarm_name,
+                "owning_team": owning_team,
                 "stagnation_ratio": str(stagnation_ratio),
                 "is_stagnant": is_stagnant,
                 "root_cause_summary": diagnostic.root_cause_summary,
@@ -465,7 +538,8 @@ def lambda_handler(event, context):
         logger.info(json.dumps({
             "event": "guard_incident_persisted",
             "incident_id": incident_id,
-            "session_id": session_id
+            "session_id": session_id,
+            "owning_team": owning_team
         }))
     except ClientError as e:
         logger.error(json.dumps({
@@ -474,16 +548,17 @@ def lambda_handler(event, context):
             "incident_id": incident_id
         }))
 
-    # 7. Dispatch Webhook Card (Tier 1 Core)
+    # 8. Dispatch Webhook Card (Tier 1 Core / Tier 2 Team Routing)
     dispatch_webhook_notification(
-        webhook_url=WEBHOOK_URL,
+        webhook_url=target_webhook_url,
         incident_id=incident_id,
         target_function=target_function,
         session_id=session_id,
         stagnation_ratio=stagnation_ratio,
         diagnostic=diagnostic,
         surgical_url=surgical_url,
-        global_url=global_url
+        global_url=global_url,
+        owning_team=owning_team
     )
 
     return {
@@ -491,6 +566,8 @@ def lambda_handler(event, context):
         "body": json.dumps({
             "incident_id": incident_id,
             "target_function": target_function,
+            "owning_team": owning_team,
+            "resolved_webhook_url": target_webhook_url,
             "session_id": session_id,
             "stagnation_ratio": stagnation_ratio,
             "is_stagnant": is_stagnant,
