@@ -55,11 +55,22 @@ def check_session_quarantine(session_id: str) -> bool:
         return False
 
 
-def build_stagnant_query(iteration: int) -> str:
+def build_stagnant_query(iteration: int, target_function_name: str = "") -> str:
     """
     Generates slightly mutated SQL/tool queries across retries,
     simulating an LLM agent reformulating failing queries (semantic stagnation).
     """
+    if "Secondary" in target_function_name or "Infra" in target_function_name:
+        base_query = "SELECT task_id, worker_instance, queue_status FROM cluster_scheduled_tasks WHERE state = 'pending'"
+        mutations = [
+            f"{base_query} ORDER BY queued_at DESC LIMIT 5",
+            f"{base_query} AND retry_id = {iteration} ORDER BY queued_at DESC LIMIT 5",
+            f"{base_query} AND retry_id = {iteration} ORDER BY queued_at DESC",
+            f"{base_query} AND task_seq = {iteration} ORDER BY queued_at DESC",
+            f"{base_query} /* attempt {iteration} */ ORDER BY queued_at DESC",
+        ]
+        return mutations[iteration % len(mutations)]
+
     base_query = "SELECT account_id, balance, risk_score FROM ledger_transactions WHERE status = 'pending_verification'"
     mutations = [
         f"{base_query} ORDER BY created_at DESC LIMIT 10",
@@ -107,7 +118,7 @@ def lambda_handler(event, context):
         }
 
     # 2. Simulate Workload Execution & Log Query Payload
-    current_query = build_stagnant_query(iteration)
+    current_query = build_stagnant_query(iteration, TARGET_FUNCTION_NAME)
     logger.info(json.dumps({
         "event": "agent_query",
         "session_id": session_id,
