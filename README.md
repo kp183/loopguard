@@ -10,48 +10,45 @@ LoopGuard detects runaway execution loops—such as recursive Lambda self-invoca
 LoopGuard functions as an event-driven closed-loop control system:
 
 ```
-[Upstream Client / Test]
+[Upstream Client / Microservice]
          │
-         ▼
-[GuardTargetFunction] ──(ConsistentRead=True)──> [DynamoDB: LoopGuardState (SESSION#<id>)]
-         │                                                      │
-    (Runaway Loop)                                         (HTTP 499 if Quarantined)
-         ▼
-[CloudWatch Metrics (Invocations >= 20 / 60s)]
-         │
-         ▼
-[CloudWatch Alarm: LoopGuard-TargetInvocationsSpike]
-         │
-         ▼
-[Amazon EventBridge Rule]
-         │
-         ▼
+         ├── Payments-Core Workload (Team: Payments-Core) ──> [DynamoDB: LoopGuardState (SESSION#<id>)]
+         └── Infra-Core Workload    (Team: Infra-Core)    ──> (HTTP 499 if Quarantined)
+                  │
+             (Runaway Loop)
+                  ▼
+[Dual CloudWatch Metric Alarms (Invocations >= 20 / 60s)]
+         ├── LoopGuard-TargetInvocationsSpike
+         └── LoopGuard-TargetSecondaryInvocationsSpike
+                  │
+                  ▼
+[Amazon EventBridge Rule (LoopGuard-AlarmRoutingRule)]
+                  │
+                  ▼
 [GuardOrchestratorFunction]
-   ├── 1. Defensive Dimension Parsing (dict or list format)
-   ├── 2. CloudWatch Log Tail Fetch & Recursive JSON Log Unwrapping
-   ├── 3. difflib.SequenceMatcher Stagnation Scoring (>= 0.70)
-   ├── 4. Bedrock (Claude 3.5 Sonnet) RCA Synthesis
+   ├── 1. Alarm Dimension Extraction & Log Tail Fetch
+   ├── 2. difflib.SequenceMatcher Stagnation Scoring (>= 0.70)
+   ├── 3. Amazon Bedrock (Claude 3.5 Sonnet) RCA Synthesis
+   ├── 4. AWS Resource Groups Tagging API (tag:GetResources) Team Resolution
    ├── 5. Persist Incident Audit Record (INCIDENT#<id>)
-   └── 6. Base Webhook Dispatch (Discord/Slack Embed with HMAC Links)
-                                    │
-                                    ▼
-                          [Webhook Notification]
-                           ├── Surgical Isolation: action=session
-                           └── Global Kill Switch: action=global
-                                    │
-                                    ▼
-                         [GuardHttpApi (/remediate)]
-                                    │
-                                    ▼
-                        [GuardRemediationFunction]
-                           ├── action=session ──> Write SESSION#<id> LOCK (TTL 600s) to DynamoDB
-                           └── action=global  ──> Set Target Concurrency = 0 via Lambda API
+   └── 6. Dynamic Team Webhook Dispatch (HMAC-tokenized Alert Cards)
+            ├── Payments-Core Alert ──> Channel A (WebhookUrlPrimary)
+            └── Infra-Core Alert    ──> Channel B (WebhookUrlSecondary)
+                                                │
+                                                ▼
+                                    [GuardHttpApi (/remediate)]
+                                                │
+                                                ▼
+                                   [GuardRemediationFunction]
+                                      ├── action=session ──> Write SESSION#<id> LOCK (TTL 600s) to DynamoDB
+                                      ├── action=global  ──> Set Target Concurrency = 0 via Lambda API
+                                      └── S3 Postmortem  ──> Generate & Upload SRE Incident Report (.md)
 ```
 
-- **Target Execution Layer:** An AWS Lambda function executes transactions while checking an active DynamoDB quarantine registry before running or re-invoking.
-- **Metric Detection Layer:** CloudWatch Alarms evaluate execution spikes over a 60-second window, emitting state-change events directly into Amazon EventBridge upon threshold breach.
-- **Orchestration & Analysis Engine:** An orchestrator Lambda retrieves recent log events, runs fuzzy sequence matching to detect semantic parameter stagnation across retries, and invokes Amazon Bedrock to extract structured diagnostics (root cause, pattern, estimated burn rate).
-- **Targeted Remediation Engine:** An API Gateway endpoint accepts cryptographically validated remediation tokens, allowing operators to trigger either surgical session isolation (halting only the affected session ID via a 10-minute DynamoDB TTL lock) or an emergency global throttle (setting function concurrency to 0).
+- **Target Execution Layer:** Multiple monitored microservices (`LoopGuard-TargetFunction` and `LoopGuard-TargetFunctionSecondary`) tagged with team ownership (`Team: Payments-Core`, `Team: Infra-Core`), evaluating strongly consistent DynamoDB session locks before execution.
+- **Metric Detection Layer:** Dual CloudWatch Alarms track per-function invocation velocity, streaming state changes into Amazon EventBridge.
+- **Orchestration & Dynamic Routing Engine:** Orchestrator retrieves structured execution logs, calculates fuzzy parameter stagnation (`difflib.SequenceMatcher`), derives root cause diagnostics via Amazon Bedrock (Claude 3.5 Sonnet), resolves resource ownership via AWS Resource Groups Tagging API, and routes alerts dynamically to dedicated team webhooks.
+- **Targeted Remediation & S3 Postmortem Engine:** Cryptographically validated HMAC links enable one-click surgical session isolation (10m DynamoDB TTL lock) or global concurrency shutdowns, while automatically compiling and archiving Markdown SRE postmortems to Amazon S3 with pre-signed download URLs.
 
 ---
 
@@ -59,12 +56,14 @@ LoopGuard functions as an event-driven closed-loop control system:
 
 | Service | Architectural Role in LoopGuard |
 |---|---|
-| **AWS Lambda** | Target execution, alarm orchestration, diagnostic extraction, and concurrency remediation. |
-| **Amazon CloudWatch** | High-frequency metric alarms tracking invocation rates and structured JSON execution logs. |
-| **Amazon EventBridge** | Event bus capturing alarm state transitions and routing them directly to orchestrator handlers. |
+| **AWS Lambda** | Monitored target microservices, alarm orchestration, diagnostic extraction, and remediation execution. |
+| **Amazon CloudWatch** | Velocity alarms ($\ge 20$ invocations/60s) and structured JSON log streaming. |
+| **Amazon EventBridge** | Real-time event bus capturing multi-alarm state transitions and routing to the orchestrator. |
+| **AWS Resource Groups Tagging API** | Zero-config dynamic ownership resolution (`tag:GetResources`) mapping microservices to team channels. |
 | **Amazon Bedrock** | Foundation model inference (Claude 3.5 Sonnet) delivering schema-enforced root-cause analysis. |
-| **Amazon DynamoDB** | Single-table state store managing active incidents and session-scoped TTL quarantine locks. |
-| **Amazon API Gateway** | HTTP API exposing secure callback routes for authenticated remediation actions. |
+| **Amazon DynamoDB** | Single-table state store managing incident audit logs and session-scoped TTL quarantine locks. |
+| **Amazon S3** | Secure long-term storage for auto-generated Markdown SRE incident postmortems with pre-signed URLs. |
+| **Amazon API Gateway** | Authenticated HTTP API (`/remediate`) validating HMAC signature tokens. |
 
 ---
 
@@ -109,51 +108,68 @@ sam deploy --guided
 
 During guided deployment, specify:
 - **Stack Name:** `LoopGuardStack`
-- **AWS Region:** `us-east-1` or `us-west-2`
-- **Parameter WebhookUrl:** Target Slack or Discord webhook URL for incident dispatch (or leave empty).
-- **Parameter HmacSecret:** Enter a secure secret token.
+- **AWS Region:** `us-east-1`
+- **Parameter WebhookUrlPrimary:** Primary webhook URL for Team `Payments-Core` (e.g., Discord or Webhook.site).
+- **Parameter WebhookUrlSecondary:** Secondary webhook URL for Team `Infra-Core`.
+- **Parameter RemediationAuthToken:** HMAC secret token for `/remediate` signature verification.
+- **Parameter BedrockModelId:** `us.anthropic.claude-sonnet-4-20250514-v1:0` or foundation model ID.
 - Allow SAM CLI to create IAM roles and confirm authorization.
 
 ---
 
-## Verification & Testing
+## Verification & Operational Testing
 
-### 1. Trigger Runaway Execution Loop
-Initiate an asynchronous runaway loop with an active session ID:
+### 1. Trigger Runaway Workloads (Multi-Team)
+Initiate an asynchronous runaway loop on either or both microservices:
 ```bash
+# Payments-Core Workload
 aws lambda invoke \
   --function-name LoopGuard-TargetFunction \
   --invocation-type Event \
-  --payload '{"runaway_mode": true, "session_id": "session-runaway-01"}' \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"runaway_mode": true, "session_id": "sess-live-payments-88"}' \
+  out.json
+
+# Infra-Core Workload
+aws lambda invoke \
+  --function-name LoopGuard-TargetFunctionSecondary \
+  --invocation-type Event \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"runaway_mode": true, "session_id": "sess-live-infra-99"}' \
   out.json
 ```
 
-### 2. Verify Alarm Trigger and Bedrock RCA
+### 2. Verify Alarm Trigger, Tag Resolution & Dual-Channel Webhook Delivery
 Monitor orchestrator execution logs:
 ```bash
 sam logs -n LoopGuard-OrchestratorFunction --tail
 ```
-Confirm that the CloudWatch alarm transitions to ALARM, the log tail is retrieved, fuzzy similarity is computed, and Bedrock generates a structured root-cause diagnostic.
+Confirm:
+- Invocations breach velocity threshold ($\ge 20$ in 60s).
+- CloudWatch Alarm fires and EventBridge invokes `LoopGuard-OrchestratorFunction`.
+- Fuzzy stagnation ratio calculated via `difflib.SequenceMatcher` ($S_{\text{stagnant}} \ge 0.70$).
+- Tag resolution queries `tag:GetResources`, resolving `Payments-Core` or `Infra-Core`.
+- Distinct alert payloads land in `WebhookUrlPrimary` and `WebhookUrlSecondary` with `HTTP 200` egress receipts.
 
-### 3. Apply Surgical Session Isolation
-Call the remediation endpoint with `action=session`:
+### 3. Apply Surgical Session Isolation (0% Blast Radius)
+Click the surgical quarantine link or invoke the remediation API:
 ```bash
-curl -i "https://<api-id>.execute-api.<region>.amazonaws.com/remediate?token=<TOKEN>&action=session&session_id=session-runaway-01&incident_id=INC-TEST"
+curl -i "https://<api-id>.execute-api.us-east-1.amazonaws.com/remediate?token=<HMAC_TOKEN>&action=session&session_id=sess-live-payments-88&incident_id=INC-LIVE"
 ```
-Re-invoke using the quarantined session ID to verify it returns HTTP 499 (`SURGICAL_QUARANTINE_ENFORCED`), while concurrent invocations with a different session ID execute with HTTP 200 (`SUCCESS`).
+Re-invoke using the quarantined session ID to verify it returns **`HTTP 499 (SURGICAL_QUARANTINE_ENFORCED)`**, while concurrent requests with a healthy session ID return **`HTTP 200 (SUCCESS)`**.
 
-### 4. Apply Emergency Global Kill Switch
-Call the remediation endpoint with `action=global`:
-```bash
-curl -i "https://<api-id>.execute-api.<region>.amazonaws.com/remediate?token=<TOKEN>&action=global&function=LoopGuard-TargetFunction&incident_id=INC-TEST"
-```
-Verify that reserved concurrency is set to 0:
-```bash
-aws lambda get-function-concurrency --function-name LoopGuard-TargetFunction
-```
+### 4. Download SRE Incident Postmortem (.md) from S3
+Upon remediation, the confirmation screen renders a one-click download button for an automated, audit-ready Markdown incident postmortem stored in Amazon S3 (`loopguard-postmortems-...`) with pre-signed authorization.
 
-### 5. Fast Rehearsal Reset (< 5 Seconds)
-Restore the environment between video takes and rehearsal drills:
+### 5. Apply Emergency Global Kill Switch
+Click the emergency global kill switch or execute:
+```bash
+curl -i "https://<api-id>.execute-api.us-east-1.amazonaws.com/remediate?token=<HMAC_TOKEN>&action=global&function=LoopGuard-TargetFunction&incident_id=INC-LIVE"
+```
+Verify that function concurrency is set to 0, instantly throttling all new invocations (**`HTTP 429 TooManyRequestsException`**).
+
+### 6. Fast Rehearsal Reset (< 6 Seconds)
+Restore both functions, clear concurrency throttles, purge quarantine locks, and reset alarms to `OK`:
 ```bash
 python scripts/reset_demo.py
 ```
@@ -162,3 +178,4 @@ python scripts/reset_demo.py
 
 ## License
 MIT License. Built for the Bharat Builds Tour (WeMakeDevs × AWS Builder Center).
+
