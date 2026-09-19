@@ -1,218 +1,253 @@
 # LoopGuard
-> Real-time, alarm-triggered circuit breaker and surgical session isolation for serverless and agent pipelines on AWS.
 
-LoopGuard detects runaway execution loops—such as recursive Lambda self-invocations and autonomous LLM agents trapped in semantic tool-retry loops—while they are actively occurring. Instead of waiting hours for billing alarms or applying blunt account-wide throttles, LoopGuard captures runtime telemetry via CloudWatch and EventBridge, performs real-time fuzzy stagnation analysis, attempts Bedrock with Groq failover for root cause analysis, and enables surgical session-level quarantine via DynamoDB Time-to-Live (TTL) locks alongside an emergency global concurrency kill switch. Protection is provided by the CloudWatch alarm and session-lock quarantine; the target function does not have a reserved concurrency ceiling.
+**Real-time, alarm-triggered circuit breaker and surgical session isolation for serverless and AI agent pipelines on AWS.**
 
----
-
-## Architecture Overview
-
-LoopGuard functions as an event-driven circuit breaker:
-
-```
-[Upstream Client / Microservice]
-         │
-         ├── Payments-Core Workload (Team: Payments-Core) ──> [DynamoDB: LoopGuardState (SESSION#<id>)]
-         └── Infra-Core Workload    (Team: Infra-Core)    ──> (HTTP 499 if Quarantined)
-                  │
-             (Runaway Loop)
-                  ▼
-[Dual CloudWatch Metric Alarms (Invocations >= 20 / 60s)]
-         ├── LoopGuard-TargetInvocationsSpike
-         └── LoopGuard-TargetSecondaryInvocationsSpike
-                  │
-                  ▼
-[Amazon EventBridge Rule (LoopGuard-AlarmRoutingRule)]
-                  │
-                  ▼
-[GuardOrchestratorFunction]
-   ├── 1. Alarm Dimension Extraction & Log Tail Fetch
-   ├── 2. difflib.SequenceMatcher Stagnation Scoring (>= 0.70)
-   ├── 3. Resilient RCA Synthesis (Bedrock -> Groq Failover -> Fallback)
-   ├── 4. AWS Resource Groups Tagging API (tag:GetResources) Team Resolution
-   ├── 5. Persist Incident Audit Record (INCIDENT#<id>)
-   └── 6. Dynamic Team Webhook Dispatch (HMAC-tokenized Alert Cards)
-            ├── Payments-Core Alert ──> Channel A (WebhookUrlPrimary)
-            └── Infra-Core Alert    ──> Channel B (WebhookUrlSecondary)
-                                                │
-                                                ▼
-                                    [GuardHttpApi (/remediate)]
-                                                │
-                                                ▼
-                                   [GuardRemediationFunction]
-                                      ├── action=session ──> Write SESSION#<id> LOCK (TTL 600s) to DynamoDB
-                                      ├── action=global  ──> Set Target Concurrency = 0 via Lambda API
-                                      └── S3 Postmortem  ──> Generate & Upload SRE Incident Report (.md)
-```
-
-- **Target Execution Layer:** Multiple monitored microservices (`LoopGuard-TargetFunction` and `LoopGuard-TargetFunctionSecondary`) tagged with team ownership (`Team: Payments-Core`, `Team: Infra-Core`), evaluating strongly consistent DynamoDB session locks before execution. Protection is provided by the CloudWatch alarm and session-lock quarantine; the target function does not have a reserved concurrency ceiling.
-- **Metric Detection Layer:** Dual CloudWatch Alarms track per-function invocation velocity, streaming state changes into Amazon EventBridge.
-- **Orchestration & Dynamic Routing Engine:** Orchestrator retrieves structured execution logs, calculates fuzzy parameter stagnation (`difflib.SequenceMatcher`), and derives root cause diagnostics. The engine attempts Amazon Bedrock first; Bedrock has not had working model access during this event window, so every incident so far has failed over to Groq (Llama 3.3 70B) via the same interface (with deterministic fallback as backstop). Resolves resource ownership via AWS Resource Groups Tagging API and routes alerts dynamically to dedicated team webhooks.
-- **Remediation & S3 Postmortem Engine:** Human-approved one-click surgical session isolation (10m DynamoDB TTL lock) or global concurrency shutdown via HMAC-signed links, while compiling and archiving Markdown SRE postmortems to Amazon S3 with pre-signed download URLs. (Autonomous quarantine is supported via an opt-in AUTONOMOUS_MODE flag, disabled by default for this submission).
+Built for **First Commit** (Bharat Builds Tour × AWS Builder Center) · Team **Kroid** · Track: **Ship It**
 
 ---
 
-## Resilient Diagnostic Cascade (Bedrock with Groq Failover)
+## The Problem
 
-LoopGuard implements a 3-tier diagnostic cascade:
-1. **Tier 1 (Primary):** Amazon Bedrock (`us.anthropic.claude-sonnet-4-20250514-v1:0` / Claude 3.5 Sonnet).
-2. **Tier 2 (Active Failover):** Groq Cloud API (`llama-3.3-70b-versatile` via standard library `urllib.request`). The engine attempts Amazon Bedrock first; Bedrock has not had working model access during this event window, so every incident so far has failed over to Groq (Llama 3.3 70B) via the same interface.
-3. **Tier 3 (Deterministic Backstop):** Zero-dependency algorithmic template guaranteeing schema-validated incident records.
+Serverless and AI agent pipelines don't usually fail by crashing. They fail by **looping**.
 
----
+- A Lambda function writes output back to the same S3 prefix that triggers it — and re-triggers itself, over and over.
+- An LLM agent hits a tool error, doesn't crash, and instead reformulates the *same* failing query five different ways — burning tokens on every attempt, often while still returning a healthy `HTTP 200`.
 
-## Native AWS Lambda Recursion Detection vs. LoopGuard
+Standard tooling is structurally blind to this:
 
-Comparison against AWS Lambda native recursive loop detection (documented at `aws.amazon.com/blogs/compute`):
-
-| Dimension | AWS Native Lambda Recursion Detection | LoopGuard Circuit Breaker |
-|---|---|---|
-| **Detection Mechanism** | Tracks 16-hop Lineage counter in the `X-Amzn-Trace-Id` header across supported services. | Evaluates CloudWatch invocation velocity alongside semantic parameter stagnation ($S_{\text{stagnant}} \ge 0.70$). |
-| **Supported Topologies** | Restricted strictly to direct Lambda $\leftrightarrow$ SQS $\leftrightarrow$ SNS $\leftrightarrow$ S3 event cycles. | Protocol-agnostic: detects loops across EventBridge, API Gateway, DynamoDB Streams, and external agent self-invoking loops. |
-| **Semantic / HTTP 200 Loops** | Inactive for application loops where an agent reformulates queries or receives HTTP 200/500 responses within its own flow. | Analyzes consecutive query payloads to catch semantic retry thrashing regardless of HTTP status codes. |
-| **Blast Radius** | Drops subsequent invocations for that function via `RecursiveInvocationException`. | Isolates only the specific rogue `session_id` via a DynamoDB TTL lock, leaving concurrent healthy sessions active. |
-
----
-
-## Core AWS Services Used
-
-| Service | Architectural Role in LoopGuard |
+| Failure mode | Why existing tools miss it |
 |---|---|
-| **AWS Lambda** | Monitored target microservices, alarm orchestration, diagnostic extraction, and remediation execution. |
-| **Amazon CloudWatch** | Velocity alarms ($\ge 20$ invocations/60s) and structured JSON log streaming. |
-| **Amazon EventBridge** | Real-time event bus capturing multi-alarm state transitions and routing to the orchestrator. |
-| **AWS Resource Groups Tagging API** | Zero-config dynamic ownership resolution (`tag:GetResources`) mapping microservices to team channels. |
-| **Amazon Bedrock & Groq** | Diagnostic cascade delivering schema-enforced root-cause analysis. |
-| **Amazon DynamoDB** | Single-table state store managing incident audit logs and session-scoped TTL quarantine locks. |
-| **Amazon S3** | Secure long-term storage for auto-generated Markdown SRE incident postmortems with pre-signed URLs. |
-| **Amazon API Gateway** | Authenticated HTTP API (`/remediate`) validating HMAC signature tokens. |
+| **Reporting latency** | AWS Cost Anomaly Detection and CUR-based billing tools update on an **8–24 hour delay**. By the time an alert fires, the cost is already on the invoice. |
+| **Metric blindness** | CloudWatch alarms watch raw invocation count and error rate. An agent stuck in a semantic retry loop can return `200 OK` on *every single call* — the system looks perfectly healthy from the outside while it burns money. |
+| **Blunt remediation** | The standard fix — `PutFunctionConcurrency(0)` or an account-level IAM deny policy — stops the function for **every caller**, not just the one broken session. |
+
+LoopGuard exists to close that specific gap: detect the loop *while it's happening*, diagnose *why*, route the alert to whoever owns it, and remediate at the **narrowest blast radius that actually solves the problem**.
 
 ---
 
-## Architectural Differentiation
+## What LoopGuard Actually Does
 
-| Dimension | AWS-Native Tooling (Budgets, Cost Anomaly) | Prior Hackathon Projects | LoopGuard |
-|---|---|---|---|
-| **Detection Latency** | 8 to 24-hour ingestion delay via billing reports. | Minutes to hours via retrospective log analysis. | Sub-60-second detection via metric alarms and inline checks. |
-| **Detection Method** | Aggregated spend thresholds. | Log-level keyword search and container health checks. | Metric velocity combined with fuzzy semantic argument diffing (`difflib`). |
-| **Blast Radius** | Account-wide IAM deny policies or full service blocks. | Manual human patches or container restarts. | Dual blast radii: surgical session-level TTL lock or global concurrency zero. |
-| **System Architecture** | Passive alerting. | Reporting with human-gated approvals. | Human-approved surgical remediation (with opt-in autonomous mode flag). |
-| **Target Workload** | General cloud infrastructure. | Monolithic microservices and containers. | Serverless pipelines and LLM agent tool loops. |
+1. **Detects** a runaway invocation spike via a live CloudWatch alarm — not a next-day billing report.
+2. **Scores** whether the repeated calls are genuinely stuck (near-identical arguments) using fuzzy string matching on the log tail, not just a raw invocation count.
+3. **Diagnoses** the likely root cause using an LLM, with a documented, tested fallback chain if the model call fails.
+4. **Routes** the alert automatically to the team that owns the misbehaving resource, based on its AWS tags.
+5. **Remediates** with a human clicking one of two links: a **surgical**, session-scoped quarantine that leaves every other user unaffected, or a **global** kill switch for when it's a systemic bug, not one bad session.
+6. **Resets** cleanly in seconds, so the whole system can be re-triggered and re-verified on demand.
 
 ---
 
-## Note on Project Lineage & Independence
+## Architecture
 
-LoopGuard is an infrastructure-level reliability system built natively using serverless AWS primitives (AWS SAM, EventBridge, Bedrock, DynamoDB). It is structurally and architecturally distinct from prior LLM observability dashboards and post-incident analysis tools (such as AgentLens and Clarity). LoopGuard operates at the infrastructure control plane to manipulate runtime concurrency and session states, maintaining zero shared code, frameworks, or dependencies with earlier projects.
+```mermaid
+flowchart TD
+    A["Upstream Client / Microservice"] -->|invokes| B["Payments-Core Workload\nLoopGuard-TargetFunction\nTeam: Payments-Core"]
+    A -->|invokes| C["Infra-Core Workload\nLoopGuard-TargetFunctionSecondary\nTeam: Infra-Core"]
+
+    B -->|checks lock| D[("DynamoDB\nLoopGuardState\nSESSION#&lt;id&gt;")]
+    C -->|checks lock| D
+    D -->|locked| E["HTTP 499\nSURGICAL_QUARANTINE_ENFORCED"]
+    D -->|not locked| F["Executes normally\nHTTP 200"]
+
+    B -->|runaway loop| G["CloudWatch Alarm\nLoopGuard-TargetInvocationsSpike\nInvocations >= 20 / 60s"]
+    C -->|runaway loop| H["CloudWatch Alarm\nLoopGuard-TargetSecondaryInvocationsSpike"]
+
+    G --> I["EventBridge Rule\nLoopGuard-AlarmRoutingRule"]
+    H --> I
+
+    I --> J["GuardOrchestratorFunction"]
+    J --> J1["1. Fetch log tail + alarm dimensions"]
+    J1 --> J2["2. difflib.SequenceMatcher\nstagnation scoring (>= 0.70)"]
+    J2 --> J3["3. RCA cascade:\nBedrock -> Groq -> deterministic fallback"]
+    J3 --> J4["4. Resolve owning team\ntag:GetResources"]
+    J4 --> J5["5. Persist incident record\nDynamoDB INCIDENT#&lt;id&gt;"]
+    J5 --> J6["6. Dispatch HMAC-signed alert"]
+
+    J6 -->|Team: Payments-Core| K["Webhook Channel A"]
+    J6 -->|Team: Infra-Core| L["Webhook Channel B"]
+
+    K --> M["/remediate endpoint\nGuardHttpApi"]
+    L --> M
+
+    M --> N["GuardRemediationFunction"]
+    N -->|action=session| O["Write SESSION#&lt;id&gt; LOCK\nDynamoDB TTL 600s"]
+    N -->|action=global| P["Set target concurrency = 0\nHTTP 429 on next call"]
+    N --> Q["Generate + upload\nS3 postmortem (.md)"]
+
+    O -.->|locks out| D
+```
+
+**Reading the diagram:** the top half is the *target workloads* being watched. The moment one loops, a CloudWatch alarm crosses into EventBridge, which wakes the orchestrator — that's the "brain" doing detection, scoring, diagnosis, and routing. The bottom half is what happens after a human clicks a link in the resulting alert: either a scoped lock (the function itself checks this lock and refuses to keep looping) or an account-wide throttle.
+
+---
+
+## The Diagnostic Cascade — Detect First, Explain Second
+
+The stagnation score (`difflib.SequenceMatcher`, comparing recent tool-call arguments) is what actually *decides* something is wrong — this part runs every time and always produces a real number from real data.
+
+What generates the **human-readable explanation** of *why* is a three-tier cascade, so a blocked or rate-limited model can never take the whole pipeline down:
+
+```mermaid
+flowchart LR
+    Start["Stagnation confirmed\nS >= 0.70"] --> T1{"Try Amazon Bedrock\nClaude Sonnet 4"}
+    T1 -->|success| Done["Structured RCA\nreturned to orchestrator"]
+    T1 -->|blocked / denied| T2{"Try Groq\nLlama 3.3 70B"}
+    T2 -->|success| Done
+    T2 -->|fails / times out| T3["Deterministic fallback template\n(always succeeds)"]
+    T3 --> Done
+```
+
+**Honest status for this submission:** Amazon Bedrock access was blocked throughout the event window by an AWS Marketplace billing constraint (`INVALID_PAYMENT_INSTRUMENT` — a known issue with AISPL-issued Indian debit cards and RBI e-mandate rules for recurring international Marketplace subscriptions). The event organizers explicitly confirmed Bedrock is not mandatory and that non-AWS AI tooling is permitted. Every incident in this submission's live verification was diagnosed via the **Groq** tier of the cascade — the Bedrock code path exists, is exercised on every incident (and fails fast, in under a second), and remains ready for when access clears.
+
+---
+
+## Remediation: Two Different Blast Radii
+
+This is the core differentiation claim, and it's the one thing in this project that's been proven live, repeatedly, not just asserted:
+
+| | **Surgical (`action=session`)** | **Global (`action=global`)** |
+|---|---|---|
+| **Mechanism** | DynamoDB TTL lock on one `session_id` | `PutFunctionConcurrency(0)` on the whole function |
+| **Blast radius** | That one session only | Every caller of that function |
+| **Verified live result** | Quarantined session → `HTTP 499` · Unrelated concurrent session → `HTTP 200` | Any subsequent call → `HTTP 429` |
+| **When to use it** | One session is misbehaving | The code itself has a systemic bug |
+
+Both actions are reached via a signed, one-time link in the alert — **remediation is human-approved by default**, not autonomous. An opt-in `AUTONOMOUS_MODE` flag exists in code (auto-quarantine when the stagnation score crosses a threshold) but ships **disabled by default** in this submission and has not been demonstrated live.
+
+---
+
+## Native AWS Recursion Detection vs. LoopGuard
+
+A fair question: doesn't AWS Lambda already detect recursive loops? Yes, partially — and this table is the honest answer to that question, not a sales pitch:
+
+| Dimension | AWS Native Lambda Recursion Detection | LoopGuard |
+|---|---|---|
+| **Mechanism** | Tracks a 16-hop counter in the `X-Amzn-Trace-Id` header | CloudWatch invocation velocity + fuzzy argument stagnation scoring |
+| **Covered event sources** | Direct Lambda ↔ SQS ↔ SNS ↔ S3 chains only | Protocol-agnostic — works across EventBridge, API Gateway, DynamoDB Streams, and self-invoking agent loops |
+| **Semantic / `HTTP 200` loops** | Blind to it — a loop that returns success on every call isn't a "recursive invocation" by AWS's definition | Specifically designed to catch this case — the entire reason the stagnation score exists |
+| **Blast radius on trip** | Drops all subsequent invocations for the function | Isolates one `session_id`; everything else keeps running |
+
+---
+
+## Core AWS Services
+
+| Service | Role |
+|---|---|
+| **AWS Lambda** | Target workloads, orchestrator, remediation function |
+| **Amazon CloudWatch** | Invocation-velocity alarms, structured log source |
+| **Amazon EventBridge** | Routes alarm state changes to the orchestrator |
+| **AWS Resource Groups Tagging API** | Resolves which team owns a misbehaving function |
+| **Amazon Bedrock & Groq** | Two-tier live diagnosis, with a deterministic backstop |
+| **Amazon DynamoDB** | Incident records + session-scoped TTL quarantine locks |
+| **Amazon S3** | Auto-generated incident postmortems, pre-signed download links |
+| **Amazon API Gateway** | Authenticated `/remediate` endpoint, HMAC-verified |
+
+---
+
+## How This Differs From Prior Work
+
+| Compared to | Key difference |
+|---|---|
+| **AWS-native tooling** (Budgets, Cost Anomaly Detection) | Sub-60-second, in-band detection vs. an 8–24 hour billing-report delay; session-scoped remediation vs. account-wide |
+| **Prior hackathon submissions in this space** | Detects argument-level *reformulation*, not just raw invocation count — the difference between "did this fire 20 times" and "is it saying the same thing 20 different ways" |
+| **This author's own prior projects** (Clarity, AgentLens) | LoopGuard watches live infrastructure and acts on it; the earlier projects are observability tools a human reads afterward. Zero shared code, framework, or dependencies. |
+
+---
+
+## Known Limitations (stated plainly, not discovered by a judge reading the code)
+
+- **Remediation is human-gated by default.** Nothing acts on your infrastructure without a click, unless `AUTONOMOUS_MODE` is explicitly enabled — which it isn't, in this submission.
+- **Bedrock never ran live during this event window** — see the Diagnostic Cascade section above. The code path exists and is exercised (and fails fast) on every incident.
+- **The target function has no reserved concurrency ceiling.** Protection comes from the CloudWatch alarm and the session-lock quarantine, not from a hard cap.
+- **Stagnation scoring has been validated against one healthy-traffic benchmark** (10 varied calls, well below threshold) but not against highly similar *legitimate* traffic, such as polling or paginated requests — a known edge case for future work.
+- **The "agent" in this demo is a scripted Lambda** cycling through fixed query variants to reliably reproduce a stagnation pattern on camera, not a live Bedrock Agent with real tool-calling.
 
 ---
 
 ## Quickstart & Deployment
 
 ### Prerequisites
-- AWS CLI installed and configured with appropriate administrator credentials.
-- AWS SAM CLI installed (`sam --version >= 1.100.0`).
-- Python 3.11 or 3.12 installed locally.
-- Amazon Bedrock model access enabled for Anthropic Claude 3.5 Sonnet (`anthropic.claude-3-5-sonnet-20240620-v1:0`) in your deployment region.
 
-### Build and Deploy
+- AWS CLI, configured
+- AWS SAM CLI (`sam --version >= 1.100.0`)
+- Python 3.11 or 3.12
+- *(Optional)* Amazon Bedrock model access for Claude — **not required to run this project.** LoopGuard fails over to Groq, and then to a deterministic diagnostic, if Bedrock is unavailable.
+- *(Optional but recommended)* A Groq API key — [console.groq.com](https://console.groq.com)
+
+### Deploy
+
 ```bash
-# Clone repository
 git clone https://github.com/kp183/loopguard.git
 cd loopguard
-
-# Build application artifacts
 sam build
 
-# Deploy infrastructure to AWS (Interactive Guided)
+# Option A — guided, interactive
 sam deploy --guided
 
-# Or configure via samconfig.toml:
-# Copy the example configuration and provide your parameter values:
+# Option B — from a config file
 cp samconfig.toml.example samconfig.toml
+# edit samconfig.toml with your own values, then:
 sam deploy
 ```
 
-During guided deployment, specify:
-- **Stack Name:** `LoopGuardStack`
-- **AWS Region:** `us-east-1`
-- **Parameter WebhookUrlPrimary:** Primary webhook URL for Team `Payments-Core` (e.g., Discord or Webhook.site).
-- **Parameter WebhookUrlSecondary:** Secondary webhook URL for Team `Infra-Core`.
-- **Parameter RemediationAuthToken:** HMAC secret token for `/remediate` signature verification.
-- **Parameter BedrockModelId:** `us.anthropic.claude-sonnet-4-20250514-v1:0` or foundation model ID.
-- **Parameter GroqApiKey:** (Optional / Recommended) Groq Cloud API key for active failover diagnostic synthesis.
-- **Parameter AutonomousMode:** `false` by default (opt-in closed-loop automatic quarantine; manual one-click approval by default).
-- **Parameter AutonomousStagnationThreshold:** `0.80` (quarantine threshold if enabled).
-- Allow SAM CLI to create IAM roles and confirm authorization.
+**Parameters you'll be asked for:**
+
+| Parameter | What it's for |
+|---|---|
+| `WebhookUrlPrimary` / `WebhookUrlSecondary` | Where alerts land for each simulated team |
+| `RemediationAuthToken` | HMAC secret for `/remediate` — generate with `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `BedrockModelId` | Which Bedrock model to attempt first (optional) |
+| `GroqApiKey` | Enables the live Groq failover tier (optional but recommended) |
+| `AutonomousMode` | `false` by default — remediation stays human-approved |
+| `AutonomousStagnationThreshold` | Only relevant if autonomous mode is enabled |
 
 ---
 
-## Verification & Operational Testing
+## Verification Walkthrough
 
-### 0. Run False-Positive & Failover Test Suite
-Verify that healthy eCommerce traffic does not trigger false positives and that failover degrades cleanly:
+### 0. Run the test suite
+
 ```bash
 python -m unittest discover tests/
 ```
-*Result:* 18 tests passing. 10 varied healthy-traffic calls scored 0.2678, well below the 0.70 stagnation threshold; this does not test against highly similar legitimate traffic such as polling or paginated requests, which is a known limitation.
 
-### 1. Trigger Runaway Workloads (Multi-Team)
-Initiate an asynchronous runaway loop on either or both microservices:
+18 tests, covering stagnation scoring, team-routing resolution and fallback, Groq failover behavior, and a healthy-traffic false-positive check.
+
+### 1. Trigger a runaway loop
+
 ```bash
-# Payments-Core Workload
-aws lambda invoke \
-  --function-name LoopGuard-TargetFunction \
-  --invocation-type Event \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{"runaway_mode": true, "session_id": "sess-live-payments-88"}' \
-  out.json
-
-# Infra-Core Workload
-aws lambda invoke \
-  --function-name LoopGuard-TargetFunctionSecondary \
-  --invocation-type Event \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{"runaway_mode": true, "session_id": "sess-live-infra-99"}' \
-  out.json
+aws lambda invoke --function-name LoopGuard-TargetFunction \
+  --invocation-type Event --cli-binary-format raw-in-base64-out \
+  --payload '{"runaway_mode": true, "session_id": "sess-demo-01"}' out.json
 ```
 
-### 2. Verify Alarm Trigger, Diagnostic Cascade & Alert Dispatch
-Monitor orchestrator execution logs:
+### 2. Watch it get diagnosed and routed
+
 ```bash
 sam logs -n LoopGuard-OrchestratorFunction --tail
 ```
-Confirm:
-- Invocations breach velocity threshold ($\ge 20$ in 60s).
-- CloudWatch Alarm fires and EventBridge invokes `LoopGuard-OrchestratorFunction`.
-- Fuzzy stagnation ratio calculated via `difflib.SequenceMatcher` ($S_{\text{stagnant}} \ge 0.70$).
-- Resilient RCA synthesized via Groq Llama 3.3 70B active failover.
-- Dynamic tag resolution queries `tag:GetResources`, routing distinct alerts to `WebhookUrlPrimary` and `WebhookUrlSecondary` with HMAC-signed one-click remediation links.
 
-### 3. Apply Surgical Session Isolation (0% Blast Radius)
-Click the surgical quarantine link or invoke the remediation API:
-```bash
-curl -i "https://<api-id>.execute-api.us-east-1.amazonaws.com/remediate?token=<HMAC_TOKEN>&action=session&session_id=sess-live-payments-88&incident_id=INC-LIVE"
-```
-Re-invoke using the quarantined session ID to verify it returns **`HTTP 499 (SURGICAL_QUARANTINE_ENFORCED)`**, while concurrent requests with a healthy session ID return **`HTTP 200 (SUCCESS)`**.
+You'll see the alarm fire, the stagnation score compute, the diagnostic cascade attempt Bedrock then fail over, the owning team resolve via the Tagging API, and the alert dispatch to the correct webhook.
 
-### 4. Download SRE Incident Postmortem (.md) from S3
-Upon remediation, the confirmation screen renders a one-click download button for an automated, audit-ready Markdown incident postmortem stored in Amazon S3 (`loopguard-postmortems-...`) with pre-signed authorization.
+### 3. Remediate — surgically
 
-### 5. Apply Emergency Global Kill Switch
-Click the emergency global kill switch or execute:
-```bash
-curl -i "https://<api-id>.execute-api.us-east-1.amazonaws.com/remediate?token=<HMAC_TOKEN>&action=global&function=LoopGuard-TargetFunction&incident_id=INC-LIVE"
-```
-Verify that function concurrency is set to 0, instantly throttling all new invocations (**`HTTP 429 TooManyRequestsException`**).
+Click the `action=session` link from the alert (or hit it directly with `curl`). Re-invoke with the same `session_id` → `HTTP 499`. Invoke with a *different* session on the *same function*, at the same time → `HTTP 200`. That's the whole "surgical, not blunt" claim, provable on screen.
 
-### 6. Fast Rehearsal Reset (< 6 Seconds)
-Restore both functions, clear concurrency throttles, purge quarantine locks, and reset alarms to `OK`:
+### 4. Remediate — globally
+
+Click the `action=global` link. Any subsequent call to that function → `HTTP 429`.
+
+### 5. Reset
+
 ```bash
 python scripts/reset_demo.py
 ```
 
+Clears concurrency overrides, resets both alarms to `OK`, purges quarantine locks — in under 6 seconds.
+
 ---
 
 ## License
-MIT License. Built for the Bharat Builds Tour (WeMakeDevs × AWS Builder Center).
 
+MIT — see [LICENSE](./LICENSE).
+
+Built for **First Commit**, event 1 of the WeMakeDevs × AWS Builder Center **Bharat Builds Tour**.
