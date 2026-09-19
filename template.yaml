@@ -18,13 +18,30 @@ Parameters:
     Description: "Incoming webhook URL for Team Infra-Core."
   RemediationAuthToken:
     Type: String
-    Default: "kroid-guard-sec-token-2026"
+    Default: ""
     NoEcho: true
     Description: "HMAC secret token used to sign and verify one-time remediation links."
   BedrockModelId:
     Type: String
     Default: "us.anthropic.claude-sonnet-4-20250514-v1:0"
     Description: "Bedrock foundation model or cross-region inference profile ID."
+  GroqApiKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: "API key for Groq Cloud failover diagnostic inference."
+  GroqModelId:
+    Type: String
+    Default: "openai/gpt-oss-20b"
+    Description: "Model ID for Groq Cloud failover diagnostic inference."
+  AutonomousMode:
+    Type: String
+    Default: "false"
+    Description: "Enable autonomous closed-loop session quarantine without waiting for human click."
+  AutonomousStagnationThreshold:
+    Type: String
+    Default: "0.80"
+    Description: "Stagnation ratio threshold to trigger autonomous session quarantine (e.g. 0.80)."
 
 Globals:
   Function:
@@ -188,6 +205,10 @@ Resources:
           WEBHOOK_URL_SECONDARY: !Ref WebhookUrlSecondary
           BEDROCK_MODEL_ID: !Ref BedrockModelId
           AWS_ACCOUNT_ID: !Sub "${AWS::AccountId}"
+          GROQ_API_KEY: !Ref GroqApiKey
+          GROQ_MODEL_ID: !Ref GroqModelId
+          AUTONOMOUS_MODE: !Ref AutonomousMode
+          AUTONOMOUS_STAGNATION_THRESHOLD: !Ref AutonomousStagnationThreshold
       Policies:
         # DynamoDB Write Access for Incident Audit Records
         - Statement:

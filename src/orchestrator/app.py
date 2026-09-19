@@ -19,6 +19,10 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
+try:
+    from botocore.config import Config
+except (ImportError, AttributeError):
+    Config = None
 from botocore.exceptions import ClientError
 
 # Configure structured logging
@@ -28,7 +32,11 @@ logger.setLevel(logging.INFO)
 # Initialize AWS clients
 logs_client = boto3.client("logs")
 dynamodb = boto3.resource("dynamodb")
-bedrock_client = boto3.client("bedrock-runtime")
+if Config:
+    bedrock_config = Config(connect_timeout=3, read_timeout=6, retries={"max_attempts": 1})
+    bedrock_client = boto3.client("bedrock-runtime", config=bedrock_config)
+else:
+    bedrock_client = boto3.client("bedrock-runtime")
 tagging_client = boto3.client("resourcegroupstaggingapi")
 
 STATE_TABLE_NAME = os.environ.get("STATE_TABLE_NAME", "LoopGuardState")
@@ -47,12 +55,16 @@ if not REMEDIATION_ENDPOINT.endswith("/remediate"):
 
 HMAC_SECRET = os.environ.get(
     "REMEDIATION_AUTH_TOKEN",
-    os.environ.get("HMAC_SECRET", "kroid-guard-sec-token-2026")
+    os.environ.get("HMAC_SECRET", "")
 )
 BEDROCK_MODEL_ID = os.environ.get(
     "BEDROCK_MODEL_ID",
     "us.anthropic.claude-sonnet-4-20250514-v1:0"
 )
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL_ID = os.environ.get("GROQ_MODEL_ID", "openai/gpt-oss-20b")
+AUTONOMOUS_MODE = os.environ.get("AUTONOMOUS_MODE", "false").lower() == "true"
+AUTONOMOUS_STAGNATION_THRESHOLD = float(os.environ.get("AUTONOMOUS_STAGNATION_THRESHOLD", "0.80"))
 
 state_table = dynamodb.Table(STATE_TABLE_NAME)
 
@@ -224,6 +236,12 @@ def compute_stagnation_ratio(queries: List[str]) -> Tuple[float, bool]:
     return round(ratio, 4), is_stagnant
 
 
+def compute_semantic_stagnation(queries: List[str]) -> Tuple[bool, float]:
+    """Alias for compute_stagnation_ratio returning (is_stagnant, ratio)."""
+    ratio, is_stagnant = compute_stagnation_ratio(queries)
+    return is_stagnant, ratio
+
+
 def generate_fallback_diagnostic(function_name: str, stagnation_ratio: float, is_stagnant: bool) -> DiagnosticResult:
     """Generates a guaranteed, deterministic diagnostic result if Bedrock is unreachable or rate-limited."""
     pattern = "SEMANTIC_RETRY_STAGNATION" if is_stagnant else "HIGH_VELOCITY_CASCADE_LOOP"
@@ -248,10 +266,10 @@ def invoke_bedrock_diagnostic(
     stagnation_ratio: float,
     is_stagnant: bool,
     recent_logs: List[str]
-) -> DiagnosticResult:
+) -> Optional[DiagnosticResult]:
     """
     Synthesizes a root-cause diagnostic using Amazon Bedrock (Anthropic Claude 3.5 Sonnet).
-    Enforces a strict 4-key JSON schema with automatic fallback.
+    Enforces a strict 4-key JSON schema. Returns None on any error to allow multi-cloud failover.
     """
     prompt = f"""Human: You are LoopGuard's automated incident diagnostics engine.
 Analyze the following CloudWatch log lines from monitored AWS Lambda function '{function_name}'.
@@ -316,8 +334,106 @@ Assistant:"""
             "error": str(err),
             "model_id": BEDROCK_MODEL_ID
         }))
+        return None
 
-    return generate_fallback_diagnostic(function_name, stagnation_ratio, is_stagnant)
+    return None
+
+
+def invoke_groq_diagnostic(
+    function_name: str,
+    stagnation_ratio: float,
+    is_stagnant: bool,
+    recent_logs: List[str]
+) -> Optional[DiagnosticResult]:
+    """
+    Synthesizes a root-cause diagnostic using Groq's OpenAI-compatible chat completions API
+    running Llama 3.3 70B (llama-3.3-70b-versatile).
+    Uses standard library urllib.request with a custom User-Agent and JSON response format.
+    """
+    if not GROQ_API_KEY:
+        return None
+
+    prompt = f"""You are LoopGuard's automated incident diagnostics engine.
+Analyze the following CloudWatch log lines from monitored AWS Lambda function '{function_name}'.
+The telemetry pipeline computed a semantic argument stagnation ratio of {stagnation_ratio:.3f} (is_stagnant={is_stagnant}).
+
+Recent logs:
+{chr(10).join(recent_logs[-15:])}
+
+You MUST return ONLY a valid JSON object with EXACTLY these four keys and no preamble or explanation:
+{{
+  "root_cause_summary": "<One sentence explaining why the loop occurred>",
+  "detected_pattern": "<SEMANTIC_RETRY_STAGNATION | RECURSIVE_CASCADE_LOOP | POISON_PILL_BATCH>",
+  "estimated_burn_rate": "<Estimated invocations or dollar cost burn per minute>",
+  "recommended_action": "<Recommended surgical or global remediation step>"
+}}"""
+
+    payload = {
+        "model": GROQ_MODEL_ID,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are LoopGuard's incident diagnosis engine. Always respond in valid JSON format."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"}
+    }
+
+    try:
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=req_data,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+                "User-Agent": "LoopGuard-DiagnosticEngine/1.0"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            if resp.status == 200:
+                resp_json = json.loads(resp.read().decode("utf-8"))
+                choices = resp_json.get("choices", [])
+                if choices:
+                    content_str = choices[0].get("message", {}).get("content", "").strip()
+                    parsed = json.loads(content_str)
+                    required_keys = ["root_cause_summary", "detected_pattern", "estimated_burn_rate", "recommended_action"]
+                    if all(k in parsed for k in required_keys):
+                        logger.info(json.dumps({
+                            "event": "guard_groq_diagnostic_success",
+                            "model": GROQ_MODEL_ID,
+                            "diagnostic_source": "GROQ_FAILOVER"
+                        }))
+                        return DiagnosticResult(
+                            root_cause_summary=str(parsed["root_cause_summary"]),
+                            detected_pattern=str(parsed["detected_pattern"]),
+                            estimated_burn_rate=str(parsed["estimated_burn_rate"]),
+                            recommended_action=str(parsed["recommended_action"])
+                        )
+    except Exception as err:
+        logger.warning(json.dumps({
+            "event": "guard_groq_invocation_fallback",
+            "error": str(err),
+            "model": GROQ_MODEL_ID
+        }))
+
+    return None
+
+
+def invoke_groq_rca(log_tail: str, stagnation_ratio: float) -> Optional[DiagnosticResult]:
+    """Convenience alias for invoke_groq_diagnostic."""
+    recent_logs = log_tail.splitlines() if isinstance(log_tail, str) else list(log_tail)
+    return invoke_groq_diagnostic(
+        function_name="LoopGuard-TargetFunction",
+        stagnation_ratio=stagnation_ratio,
+        is_stagnant=stagnation_ratio >= 0.70,
+        recent_logs=recent_logs
+    )
 
 
 def resolve_team_webhook(target_function_name: str, context: Any = None) -> Tuple[str, str]:
@@ -386,7 +502,9 @@ def dispatch_webhook_notification(
     diagnostic: DiagnosticResult,
     surgical_url: str,
     global_url: str,
-    owning_team: str = "Unassigned"
+    owning_team: str = "Unassigned",
+    autonomous_action_taken: bool = False,
+    diagnostic_provider: str = "DETERMINISTIC_FALLBACK"
 ) -> bool:
     """
     Tier 1 Base Webhook / Tier 2 Team-Routed Webhook Dispatch.
@@ -404,34 +522,72 @@ def dispatch_webhook_notification(
         }))
         return False
 
-    # Universal payload structured for Discord and Slack webhooks
+    alert_header = (
+        f"🚨 **LoopGuard Alert: {incident_id} [{owning_team}] (AUTONOMOUSLY REMEDIATED)**"
+        if autonomous_action_taken
+        else f"🚨 **LoopGuard Alert: {incident_id} [{owning_team}]**"
+    )
+
+    embed_title = (
+        f"⚡ Runaway Loop Intercepted & Quarantined Autonomously: `{target_function}` [{owning_team}]"
+        if autonomous_action_taken
+        else f"Runaway Loop Intercepted: `{target_function}` [{owning_team}]"
+    )
+
+    fields = [
+        {"name": "Target Function", "value": f"`{target_function}`", "inline": True},
+        {"name": "Owning Team", "value": f"`{owning_team}`", "inline": True},
+        {"name": "Session ID", "value": f"`{session_id}`", "inline": True},
+        {"name": "Stagnation Ratio", "value": f"**{stagnation_ratio:.3f}** (Threshold: 0.700)", "inline": True},
+        {"name": "Diagnostic Source", "value": f"`{diagnostic_provider}`", "inline": True},
+        {"name": "Detected Pattern", "value": f"`{diagnostic.detected_pattern}`", "inline": True},
+        {"name": "Estimated Burn Rate", "value": diagnostic.estimated_burn_rate, "inline": True},
+        {"name": "Root Cause Summary", "value": diagnostic.root_cause_summary, "inline": False}
+    ]
+
+    if autonomous_action_taken:
+        fields.extend([
+            {
+                "name": "⚡ Action Taken: Autonomous Surgical Isolation",
+                "value": (
+                    f"🔒 **Session `{session_id}` quarantined inline via DynamoDB TTL lock (600s).**\n"
+                    f"*Blast radius: 0%. Legitimate user requests continue processing normally.*"
+                ),
+                "inline": False
+            },
+            {
+                "name": "⚙️ Manual Overrides",
+                "value": f"[Release Session Lock]({surgical_url}) • [Emergency Global Throttle (0 Concurrency)]({global_url})",
+                "inline": False
+            }
+        ])
+    else:
+        fields.extend([
+            {
+                "name": "🎯 Surgical Session Isolation (10m TTL Lock)",
+                "value": f"[Click to Quarantine Session `{session_id}`]({surgical_url})",
+                "inline": False
+            },
+            {
+                "name": "🛑 Global Emergency Override (Kill Switch)",
+                "value": f"[Click to Throttle Target Concurrency to 0]({global_url})",
+                "inline": False
+            }
+        ])
+
     card = {
-        "content": f"🚨 **LoopGuard Circuit Breaker Alert: {incident_id} [{owning_team}]**",
+        "content": alert_header,
         "embeds": [
             {
-                "title": f"Runaway Loop Intercepted: `{target_function}` [{owning_team}]",
+                "title": embed_title,
                 "color": 15158332,  # Crimson Red
-                "fields": [
-                    {"name": "Target Function", "value": f"`{target_function}`", "inline": True},
-                    {"name": "Owning Team", "value": f"`{owning_team}`", "inline": True},
-                    {"name": "Session ID", "value": f"`{session_id}`", "inline": True},
-                    {"name": "Stagnation Ratio", "value": f"**{stagnation_ratio:.3f}** (Threshold: 0.700)", "inline": True},
-                    {"name": "Detected Pattern", "value": f"`{diagnostic.detected_pattern}`", "inline": True},
-                    {"name": "Estimated Burn Rate", "value": diagnostic.estimated_burn_rate, "inline": True},
-                    {"name": "Root Cause Summary", "value": diagnostic.root_cause_summary, "inline": False},
-                    {
-                        "name": "🎯 Surgical Session Isolation (10m TTL Lock)",
-                        "value": f"[Click to Quarantine Session `{session_id}`]({surgical_url})",
-                        "inline": False
-                    },
-                    {
-                        "name": "🛑 Global Emergency Override (Kill Switch)",
-                        "value": f"[Click to Throttle Target Concurrency to 0]({global_url})",
-                        "inline": False
-                    }
-                ],
+                "fields": fields,
                 "footer": {
-                    "text": f"Incident ID: {incident_id} • Team: {owning_team} • LoopGuard Autonomous Reliability Engine"
+                    "text": (
+                        f"Incident ID: {incident_id} • Team: {owning_team} • "
+                        f"Engine: {diagnostic_provider} • "
+                        f"{'Closed-Loop Mode' if autonomous_action_taken else 'Human-Approved Mode'}"
+                    )
                 }
             }
         ]
@@ -483,13 +639,40 @@ def lambda_handler(event, context):
     # 3. Compute Semantic Stagnation Ratio (difflib)
     stagnation_ratio, is_stagnant = compute_stagnation_ratio(queries)
 
-    # 4. Amazon Bedrock Claude 3.5 Sonnet Diagnostic Analysis
+    # 4. Multi-Tier Resilient Diagnostic Cascade (Bedrock -> Groq Failover -> Deterministic Fallback)
     diagnostic = invoke_bedrock_diagnostic(
         function_name=target_function,
         stagnation_ratio=stagnation_ratio,
         is_stagnant=is_stagnant,
         recent_logs=raw_logs
     )
+    diagnostic_provider = "AMAZON_BEDROCK"
+
+    if not diagnostic and GROQ_API_KEY:
+        logger.info(json.dumps({
+            "event": "guard_diagnostic_failover_initiated",
+            "primary": "AMAZON_BEDROCK",
+            "failover_target": "GROQ_FAILOVER",
+            "message": f"Bedrock primary unavailable... Initiating failover to Groq ({GROQ_MODEL_ID})..."
+        }))
+        diagnostic = invoke_groq_diagnostic(
+            function_name=target_function,
+            stagnation_ratio=stagnation_ratio,
+            is_stagnant=is_stagnant,
+            recent_logs=raw_logs
+        )
+        if diagnostic:
+            diagnostic_provider = f"GROQ_FAILOVER_{GROQ_MODEL_ID}"
+            logger.info(f"RCA generated via active failover: Groq {GROQ_MODEL_ID}.")
+
+    if not diagnostic:
+        logger.info("RCA generated via deterministic fallback engine.")
+        diagnostic = generate_fallback_diagnostic(
+            function_name=target_function,
+            stagnation_ratio=stagnation_ratio,
+            is_stagnant=is_stagnant
+        )
+        diagnostic_provider = "DETERMINISTIC_FALLBACK"
 
     # 5. Generate Authenticated Remediation URLs
     token_session = generate_hmac_token(HMAC_SECRET, f"{incident_id}:session:{session_id}")
@@ -514,7 +697,46 @@ def lambda_handler(event, context):
     # 6. Resolve Destination Webhook via Team Tag Routing
     owning_team, target_webhook_url = resolve_team_webhook(target_function, context)
 
-    # 7. Persist Incident Audit Record in DynamoDB (Single Table Schema)
+    # 7. Autonomous Closed-Loop Circuit Breaker Enforcement
+    autonomous_action_taken = False
+    if (
+        AUTONOMOUS_MODE
+        and is_stagnant
+        and stagnation_ratio >= AUTONOMOUS_STAGNATION_THRESHOLD
+        and session_id != "unknown-session"
+    ):
+        try:
+            lock_ttl = int(time.time()) + 600
+            state_table.put_item(
+                Item={
+                    "PK": f"SESSION#{session_id}",
+                    "SK": "LOCK",
+                    "incident_id": incident_id,
+                    "quarantine_type": "AUTONOMOUS_SURGICAL_LOCK",
+                    "stagnation_ratio": str(stagnation_ratio),
+                    "created_at": int(time.time()),
+                    "ttl": lock_ttl
+                }
+            )
+            autonomous_action_taken = True
+            logger.info(json.dumps({
+                "event": "guard_autonomous_circuit_breaker_triggered",
+                "message": f"AUTONOMOUS_CIRCUIT_BREAKER: Quarantined session {session_id} inline without manual intervention.",
+                "session_id": session_id,
+                "incident_id": incident_id,
+                "stagnation_ratio": stagnation_ratio,
+                "lock_ttl": lock_ttl
+            }))
+        except Exception as e:
+            logger.error(json.dumps({
+                "event": "guard_autonomous_quarantine_error",
+                "error": str(e),
+                "session_id": session_id
+            }))
+
+    incident_status = "REMEDIATED_AUTONOMOUS_LOCK" if autonomous_action_taken else "ANALYZED"
+
+    # 8. Persist Incident Audit Record in DynamoDB (Single Table Schema)
     try:
         state_table.put_item(
             Item={
@@ -529,9 +751,11 @@ def lambda_handler(event, context):
                 "root_cause_summary": diagnostic.root_cause_summary,
                 "detected_pattern": diagnostic.detected_pattern,
                 "estimated_burn_rate": diagnostic.estimated_burn_rate,
+                "diagnostic_provider": diagnostic_provider,
+                "autonomous_action_taken": autonomous_action_taken,
                 "remediation_url_session": surgical_url,
                 "remediation_url_global": global_url,
-                "status": "ANALYZED",
+                "status": incident_status,
                 "ttl": int(time.time()) + 86400  # 24-hour audit retention
             }
         )
@@ -539,7 +763,9 @@ def lambda_handler(event, context):
             "event": "guard_incident_persisted",
             "incident_id": incident_id,
             "session_id": session_id,
-            "owning_team": owning_team
+            "owning_team": owning_team,
+            "diagnostic_provider": diagnostic_provider,
+            "status": incident_status
         }))
     except ClientError as e:
         logger.error(json.dumps({
@@ -548,7 +774,7 @@ def lambda_handler(event, context):
             "incident_id": incident_id
         }))
 
-    # 8. Dispatch Webhook Card (Tier 1 Core / Tier 2 Team Routing)
+    # 9. Dispatch Webhook Card (Tier 1 Core / Tier 2 Team Routing)
     dispatch_webhook_notification(
         webhook_url=target_webhook_url,
         incident_id=incident_id,
@@ -558,7 +784,9 @@ def lambda_handler(event, context):
         diagnostic=diagnostic,
         surgical_url=surgical_url,
         global_url=global_url,
-        owning_team=owning_team
+        owning_team=owning_team,
+        autonomous_action_taken=autonomous_action_taken,
+        diagnostic_provider=diagnostic_provider
     )
 
     return {
@@ -571,6 +799,8 @@ def lambda_handler(event, context):
             "session_id": session_id,
             "stagnation_ratio": stagnation_ratio,
             "is_stagnant": is_stagnant,
+            "diagnostic_provider": diagnostic_provider,
+            "autonomous_action_taken": autonomous_action_taken,
             "diagnostic": diagnostic.to_dict(),
             "surgical_url": surgical_url,
             "global_url": global_url

@@ -52,6 +52,7 @@ LoopGuard separates application execution from the monitoring, diagnostic, and r
 2. The target function performs a strongly consistent read against DynamoDB (`PK = SESSION#<session_id>`, `SK = LOCK`).
 3. If an active quarantine lock is detected, execution halts immediately with HTTP 499 (`SURGICAL_QUARANTINE_ENFORCED`).
 4. If healthy, execution proceeds. When configured in runaway mode, the function triggers asynchronous self-invocations, mutating query parameters to simulate an agent reformulating failing queries.
+5. Protection is provided by the CloudWatch alarm and session-lock quarantine; the target function does not have a reserved concurrency ceiling.
 
 ### Phase B: Anomaly Ingestion & Event Routing
 1. Asynchronous execution cascades generate rapid metric spikes in Amazon CloudWatch.
@@ -63,8 +64,8 @@ LoopGuard separates application execution from the monitoring, diagnostic, and r
 1. The orchestrator extracts the target function name, handling both dict and list metric dimension schemas.
 2. The orchestrator retrieves recent log streams from CloudWatch Logs, recursively unpacking outer structured JSON envelopes to access inner application payloads.
 3. The orchestrator executes `difflib.SequenceMatcher` over consecutive tool inputs. An average similarity score $\ge 0.70$ flags semantic stagnation.
-4. The log tail and stagnation metrics are submitted to Amazon Bedrock (Anthropic Claude 3.5 Sonnet).
-5. Bedrock outputs a validated JSON schema containing root cause, detected pattern, estimated burn rate, and operational recommendations.
+4. The log tail and stagnation metrics are submitted to the diagnostic cascade, which attempts Amazon Bedrock (Claude 3.5 Sonnet) first with a fast-fail timeout (connect: 3s, read: 6s) and cleanly fails over to Groq (Llama 3.3 70B), with a deterministic fallback engine as backstop.
+5. The diagnostic engine outputs a validated JSON schema containing root cause, detected pattern, estimated burn rate, and operational recommendations.
 6. The diagnostic record is persisted in DynamoDB (`PK = INCIDENT#<id>`, `SK = METADATA`).
 7. The orchestrator dispatches a structured incident card containing remediation links directly to a configured Discord or Slack webhook.
 

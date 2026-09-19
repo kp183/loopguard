@@ -6,3 +6,4 @@ response.json
 out.json
 *.swp
 .DS_Store
+samconfig.toml

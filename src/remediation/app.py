@@ -31,18 +31,18 @@ STATE_TABLE_NAME = os.environ.get("STATE_TABLE_NAME", "LoopGuardState")
 POSTMORTEM_BUCKET = os.environ.get("POSTMORTEM_BUCKET", "")
 HMAC_SECRET = os.environ.get(
     "REMEDIATION_AUTH_TOKEN",
-    os.environ.get("HMAC_SECRET", "kroid-guard-sec-token-2026")
+    os.environ.get("HMAC_SECRET", "")
 )
 state_table = dynamodb.Table(STATE_TABLE_NAME)
 
 
 def verify_hmac_token(secret: str, token: str, message: str) -> bool:
-    """Verifies the HMAC token against the message payload."""
-    if not token:
+    """
+    Verifies the HMAC token against the message payload.
+    Enforces strict HMAC-SHA256 signature verification. No master-secret bypass.
+    """
+    if not token or not secret:
         return False
-    # Direct match or dev tokens
-    if token == secret or token in ["TEST", "DEMO", "<TOKEN>"]:
-        return True
     expected = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
     return hmac.compare_digest(token, expected)
 
@@ -107,6 +107,7 @@ def generate_s3_postmortem(incident_id: str, action_taken: str, target: str) -> 
     pattern = incident_item.get("detected_pattern", "SEMANTIC_RETRY_STAGNATION")
     burn_rate = incident_item.get("estimated_burn_rate", "~30-60 invocations/min")
     session_id = incident_item.get("session_id", target if action_taken == "SURGICAL_SESSION_ISOLATION" else "N/A")
+    diagnostic_provider = incident_item.get("diagnostic_provider", "MULTI_CLOUD_CASCADE")
 
     postmortem_md = fr"""# LoopGuard SRE Incident Postmortem
 **Incident ID:** `{incident_id}`  
@@ -123,7 +124,8 @@ def generate_s3_postmortem(incident_id: str, action_taken: str, target: str) -> 
 
 ---
 
-## 2. Root Cause Analysis (Bedrock RCA)
+## 2. Root Cause Analysis ({diagnostic_provider})
+* **Diagnostic Provider:** `{diagnostic_provider}`
 * **Detected Loop Pattern:** `{pattern}`
 * **Semantic Stagnation Ratio ($S_{{\text{{stagnant}}}}$):** `{stagnation_ratio}` ($\ge 0.70$ threshold breached)
 * **Estimated Burn Rate:** `{burn_rate}`
