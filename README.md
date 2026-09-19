@@ -118,14 +118,19 @@ LoopGuard is an infrastructure-level reliability system built natively using ser
 ### Build and Deploy
 ```bash
 # Clone repository
-git clone https://github.com/team-kroid/loopguard.git
+git clone https://github.com/kp183/loopguard.git
 cd loopguard
 
 # Build application artifacts
 sam build
 
-# Deploy infrastructure to AWS
+# Deploy infrastructure to AWS (Interactive Guided)
 sam deploy --guided
+
+# Or configure via samconfig.toml:
+# Copy the example configuration and provide your parameter values:
+cp samconfig.toml.example samconfig.toml
+sam deploy
 ```
 
 During guided deployment, specify:

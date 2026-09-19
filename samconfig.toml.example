@@ -1,0 +1,43 @@
+# ==============================================================================
+# LoopGuard - AWS SAM Deployment Configuration Template (Example)
+# Copy this file to samconfig.toml and provide your deployment parameters.
+# Never commit samconfig.toml with active secrets to version control.
+# ==============================================================================
+
+version = 0.1
+
+[default]
+[default.global]
+[default.global.parameters]
+stack_name = "LoopGuardStack"
+
+[default.build]
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate]
+[default.validate.parameters]
+lint = true
+
+[default.deploy]
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+resolve_s3 = true
+stack_name = "LoopGuardStack"
+s3_prefix = "LoopGuardStack"
+region = "us-east-1"
+disable_rollback = true
+parameter_overrides = [
+  "RemediationAuthToken=\"<generate-32-byte-hex-with-python-secrets>\"",
+  "WebhookUrl=\"\"",
+  "WebhookUrlPrimary=\"<your-primary-webhook-url>\"",
+  "WebhookUrlSecondary=\"<your-secondary-webhook-url>\"",
+  "BedrockModelId=\"us.anthropic.claude-sonnet-4-20250514-v1:0\"",
+  "GroqApiKey=\"<your-groq-api-key>\"",
+  "GroqModelId=\"openai/gpt-oss-20b\"",
+  "AutonomousMode=\"false\"",
+  "AutonomousStagnationThreshold=\"0.80\""
+]
+image_repositories = []
