@@ -10,7 +10,7 @@
 
 Built for **First Commit** (Bharat Builds Tour × AWS Builder Center) · Team **Kroid** · Track: **Ship It**
 
-📺 **[Demo Video](#)** *(add link once uploaded)* · 💻 **[Live Repo](https://github.com/kp183/loopguard)**
+📺 **https://youtu.be/TO0MQRAhGds**  · 💻 **[Live Repo](https://github.com/kp183/loopguard)**
 
 ---
 
